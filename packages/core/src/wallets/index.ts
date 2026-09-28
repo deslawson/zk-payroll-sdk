@@ -12,6 +12,7 @@ export {
   SignedTransaction,
   WalletError,
   WalletErrorCode,
+  WalletRejectionError,
 } from "./IWalletAdapter";
 
 export { FreighterAdapter } from "./FreighterAdapter";

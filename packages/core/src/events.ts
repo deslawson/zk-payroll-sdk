@@ -1,7 +1,8 @@
 import { rpc } from "@stellar/stellar-sdk";
 import { EventEmitter } from "events";
 import { ContractExecutionError, ContractErrorCode } from "./errors";
-import { withRetry } from "./core";
+import { RetryOperationType, withRetryBudget } from "./core/retry-budget";
+import { normalizeRequestId } from "./core/request-id";
 
 /** Default polling interval in milliseconds */
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
@@ -16,6 +17,8 @@ export interface ConfirmationOptions {
   pollIntervalMs?: number;
   /** Maximum polling attempts before timeout (default: 15) */
   maxPolls?: number;
+  /** Optional AbortSignal to cancel polling */
+  signal?: AbortSignal;
   /**
    * Optional request ID for correlating submission and polling flows.
    * Use `RunIdentifier.generateRequestId()` to create a deterministic
@@ -56,9 +59,9 @@ export type TransactionWatcherEvents = {
   /** Emitted when the transaction is confirmed (success or failure) */
   confirmed: [ConfirmationResult];
   /** Emitted when polling times out */
-  timeout: [{ txHash: string; attempts: number }];
+  timeout: [{ txHash: string; attempts: number; requestId?: string }];
   /** Emitted when polling is cancelled via AbortSignal */
-  cancelled: [{ txHash: string }];
+  cancelled: [{ txHash: string; requestId?: string }];
   /** Emitted on unexpected errors during polling */
   error: [Error];
 };
@@ -104,21 +107,23 @@ export class TransactionWatcher extends EventEmitter {
     const pollInterval = options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const maxPolls = options?.maxPolls ?? DEFAULT_MAX_POLLS;
     const signal = options?.signal;
+    // Validate up front so a malformed id fails fast with a redacted
+    // ValidationError instead of leaking into events and error messages.
+    const requestId = normalizeRequestId(options?.requestId);
+    const suffix = requestId ? ` [requestId: ${requestId}]` : "";
 
     if (signal?.aborted) {
-      this.emit("cancelled", { txHash });
-      throw new Error(`Polling for transaction ${txHash} was cancelled.`);
+      this.emit("cancelled", { txHash, requestId });
+      throw new Error(`Polling for transaction ${txHash} was cancelled.${suffix}`);
     }
-
-    const requestId = options?.requestId;
 
     for (let attempt = 1; attempt <= maxPolls; attempt++) {
       try {
         await sleep(pollInterval, signal);
-      } catch (err: any) {
-        if (err.message === "AbortError") {
-          this.emit("cancelled", { txHash });
-          throw new Error(`Polling for transaction ${txHash} was cancelled.`);
+      } catch (err: unknown) {
+        if ((err as Error).message === "AbortError") {
+          this.emit("cancelled", { txHash, requestId });
+          throw new Error(`Polling for transaction ${txHash} was cancelled.${suffix}`);
         }
         throw err;
       }
@@ -127,9 +132,9 @@ export class TransactionWatcher extends EventEmitter {
 
       let txResponse: rpc.Api.GetTransactionResponse;
       try {
-        txResponse = await withRetry(() => this.server.getTransaction(txHash), {
-          attempts: 3,
-          delayMs: 100,
+        txResponse = await withRetryBudget(() => this.server.getTransaction(txHash), {
+          operationType: RetryOperationType.POLL,
+          signal,
         });
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -158,7 +163,7 @@ export class TransactionWatcher extends EventEmitter {
         };
         this.emit("confirmed", failResult);
         throw new ContractExecutionError(
-          `Transaction ${txHash} failed on-chain${requestId ? ` [requestId: ${requestId}]` : ""}`,
+          `Transaction ${txHash} failed on-chain${suffix}`,
           ContractErrorCode.CONTRACT_REVERT
         );
       }
@@ -167,9 +172,9 @@ export class TransactionWatcher extends EventEmitter {
     }
 
     // Timed out
-    this.emit("timeout", { txHash, attempts: maxPolls });
+    this.emit("timeout", { txHash, attempts: maxPolls, requestId });
     throw new ContractExecutionError(
-      `Transaction ${txHash} timed out after ${maxPolls} polls${requestId ? ` [requestId: ${requestId}]` : ""}`,
+      `Transaction ${txHash} timed out after ${maxPolls} polls${suffix}`,
       ContractErrorCode.TRANSACTION_TIMEOUT
     );
   }
@@ -203,3 +208,5 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }
   });
 }
+
+export { parseArchiveEvent, ARCHIVE_EVENT_TOPICS } from "./archive/events";

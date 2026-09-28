@@ -2,11 +2,19 @@
  * ZK Payroll SDK — Main entry point.
  *
  * Architecture layers:
+ *   api/      — Public-facing classes and interfaces
+ *   core/     — Business logic (ZK proofs, payroll, caching)
  *   adapters/ — Low-level blockchain/Soroban wrappers
- *   crypto/   — ZK proof generation
- *   cache/    — Caching providers
- *   testing/  — Mock utilities
  */
+
+// ── API Layer ───────────────────────────────────────────────────────────────
+export * from "./api";
+
+// ── Core Layer ──────────────────────────────────────────────────────────────
+export * from "./core";
+
+// ── Backward-compat error aliases (not in the core layer) ───────────────────
+export { PayrollError, PayrollServiceErrorCode, handleApiError } from "./errors";
 
 // ── Adapters Layer ──────────────────────────────────────────────────────────
 export { PayrollService } from "./payroll";
@@ -21,22 +29,74 @@ export {
   NetworkError,
   ProofGenerationError,
   ContractExecutionError,
+  RpcTimeoutError,
+  InvalidResponseError,
   ValidationError,
   ContractErrorCode,
+  WalletError,
+  WalletRejectionError,
+  WalletErrorCode,
+  ReconciliationErrorCode,
+  toUserFriendlyError,
+  formatRedactedError,
+  DEFAULT_ERROR_MESSAGES,
   mapRpcError,
-  PayrollError,
+  ErrorCategory,
+  ERROR_CODE_REGISTRY,
+  getErrorCategory,
+  isRetryableErrorCode,
+  getSuggestedMessage,
+  getErrorCodesByCategory,
 } from "./errors";
-export type { ErrorContext, ContractErrorCodeType } from "./errors";
-export { DEFAULT_CONFIG } from "./config";
+export type {
+  ErrorContext,
+  ContractErrorCodeType,
+  WalletErrorCodeType,
+  ReconciliationErrorCodeType,
+  UserFriendlyError,
+  FormattedError,
+  ErrorMessageOverrides,
+  ErrorCategoryType,
+  ErrorCodeEntry,
+} from "./errors";
+export type {
+  ClientConfig,
+  RetryPolicyConfig,
+  FeatureFlagsConfig,
+  ConfigValidationErrorDetail,
+  ConfigValidationResult,
+  ConfigMigrationWarning,
+  ConfigMigrationResult,
+} from "./config";
+export {
+  DEFAULT_CONFIG,
+  ConfigPresets,
+  ConfigBuilder,
+  validateConfig,
+  assertValidConfig,
+  migrateConfig,
+  detectDeprecatedConfigFields,
+} from "./config";
 export * from "./cache";
 export * from "./types";
 export * from "./progress";
-export { IdempotencyRegistry, createPaymentIdempotencyKey } from "./core/idempotency";
+export {
+  IdempotencyRegistry,
+  createPaymentIdempotencyKey,
+  createPayrollIdempotencyKey,
+} from "./core/idempotency";
+export type { PayrollIdempotencyKeyInput, PaymentIdempotencyKeyInput } from "./core/idempotency";
+export { Semaphore } from "./core/concurrency";
 export * from "./crypto/IProofGenerator";
+export * from "./proofs/freshness";
+export { resolveProofConfig, resolveProofConfigFromEnv } from "./crypto/ProofConfigResolver";
+export type { ProofConfigResolverOptions } from "./crypto/ProofConfigResolver";
+// Keep backward compatibility with existing adapters barrel export
 export * from "./adapters";
 
-// ── Wallet Adapters ─────────────────────────────────────────────────────────
-export * from "./wallets";
+// ── Polling Helpers ───────────────────────────────────────────────────────────
+export * from "./polling";
+
 // ── Logging ─────────────────────────────────────────────────────────────────
 export * from "./logging";
 
@@ -49,28 +109,33 @@ export * from "./testing";
 // ── Events ──────────────────────────────────────────────────────────────────
 export { TransactionWatcher } from "./events";
 export type { ConfirmationOptions, ConfirmationResult } from "./events";
+export * from "./events/index";
+export * from "./event-parser";
 
-// ── Pagination Helpers ───────────────────────────────────────────────────────
-export * from "./pagination";
+// ── Assets ────────────────────────────────────────────────────────────────────
+export * from "./assets";
 
-// ── Event Stream Parser ──────────────────────────────────────────────────────
+// ── Proofs ────────────────────────────────────────────────────────────────────
 export {
-  parseContractEvent,
-  parseContractEvents,
-  EventParsingError,
-} from "./event-parser";
-export type {
-  RawContractEvent,
-  TypedContractEvent,
-  RegisteredEvent,
-  RegistryUpdatedEvent,
-  RegistryDeactivatedEvent,
-  CommittedEvent,
-  SalaryRevealedEvent,
-  PaymentExecutedEvent,
-  PaymentScheduledEvent,
-  PaymentCancelledEvent,
-} from "./event-parser";
+  MissingProofError,
+  isMissingProofError,
+  isProofError,
+  getMissingProofRemediation,
+  getProofRemediation,
+  getMissingProofErrorRemediation,
+  formatMissingProofError,
+  formatProofError,
+  MISSING_PROOF_REMEDIATION,
+  GENERIC_PROOF_REMEDIATION,
+  ProofVerificationError,
+  ProofVerificationErrorCode,
+} from "./proofs/errors";
+export type { ProofVerificationErrorCodeType } from "./proofs/errors";
+
+// ── Proof Verification Adapter ───────────────────────────────────────────────
+export * from "./proofs/types";
+export * from "./proofs/verifierAdapter";
+export { ProofVerificationClient, verifyProofWithAdapter } from "./client";
 
 // ── Typed Contract Clients ───────────────────────────────────────────────────
 export * from "./clients";
@@ -78,6 +143,9 @@ export * from "./clients";
 // ── Environment Sanity Checker ──────────────────────────────────────────────
 export * from "./sanity";
 export * from "./employer-readiness";
+
+// ── Proof Readiness Checker ─────────────────────────────────────────────────
+export * from "./proof-readiness";
 
 // ── Transaction Simulation ──────────────────────────────────────────────────
 export * from "./simulation";
@@ -87,6 +155,9 @@ export * from "./draft";
 
 // ── History Filter Builders ─────────────────────────────────────────────────
 export * from "./filters";
+
+// ── Archived Payroll History Helpers ────────────────────────────────────────
+export * from "./archived";
 
 // ── Redaction Utilities ─────────────────────────────────────────────────────
 export * from "./redaction";

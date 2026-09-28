@@ -1,25 +1,334 @@
-import { ProofGeneratorConfig } from "./crypto/IProofGenerator";
-import { StrKey } from "@stellar/stellar-sdk";
+import type { ProofGeneratorConfig } from "./crypto/IProofGenerator";
+let StrKeyModule: any;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  StrKeyModule = require("@stellar/stellar-sdk")?.StrKey;
+} catch {
+  // fallback for environments without stellar-sdk in node_modules
+}
+import { ValidationError } from "./core/errors";
+
+export interface RetryPolicyConfig {
+  maxAttempts?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  backoffFactor?: number;
+  /** Optional random extra delay (in ms) applied on top of the exponential backoff. */
+  jitterMs?: number;
+  /** Optional overall retry deadline in milliseconds, measured from the first attempt. */
+  timeoutMs?: number;
+}
+
+/**
+ * Per-operation-type retry budgets. Each operation type resolves its own
+ * budget from these overrides on top of the built-in defaults, so idempotent
+ * reads can be retried aggressively while non-idempotent writes stay protected.
+ */
+export interface RetryBudgetsConfig {
+  /** Idempotent read operations (e.g. getAccount, simulateTransaction). */
+  read?: RetryPolicyConfig;
+  /** Non-idempotent write/transaction submissions. */
+  write?: RetryPolicyConfig;
+  /** Idempotent transaction status polling. */
+  poll?: RetryPolicyConfig;
+}
+
+export type FeatureFlagsConfig = Record<string, boolean>;
 
 export interface ClientConfig {
   networkUrl: string;
+  rpcUrl?: string;
+  network?: string;
   contractId: string;
+  contractIds?: Record<string, string>;
   adminKey?: string;
   proofConfig?: ProofGeneratorConfig;
+  retryPolicy?: RetryPolicyConfig;
+  retryBudgets?: RetryBudgetsConfig;
+  featureFlags?: FeatureFlagsConfig;
+}
+
+export interface ConfigValidationErrorDetail {
+  field: string;
+  message: string;
+}
+
+export interface ConfigValidationResult {
+  isValid: boolean;
+  errors: ConfigValidationErrorDetail[];
+}
+
+function isValidContractId(id: string): boolean {
+  if (!id || typeof id !== "string") return false;
+  try {
+    if (StrKeyModule && typeof StrKeyModule.isValidContract === "function") {
+      return StrKeyModule.isValidContract(id);
+    }
+  } catch {
+    // fallback to Soroban contract ID regex pattern
+  }
+  return /^C[A-Z2-7]{55}$/.test(id);
+}
+
+/**
+ * Validate a single retry policy object (either the legacy `retryPolicy` or
+ * one of the per-operation `retryBudgets`). `path` is used to build
+ * human-readable field names for validation errors.
+ */
+function validateRetryPolicyConfig(
+  policy: RetryPolicyConfig,
+  path: string
+): ConfigValidationErrorDetail[] {
+  const errors: ConfigValidationErrorDetail[] = [];
+  const { maxAttempts, initialDelayMs, maxDelayMs, backoffFactor, jitterMs, timeoutMs } = policy;
+
+  if (maxAttempts !== undefined && (typeof maxAttempts !== "number" || maxAttempts < 1)) {
+    errors.push({
+      field: `${path}.maxAttempts`,
+      message: `${path}.maxAttempts must be at least 1.`,
+    });
+  }
+  if (initialDelayMs !== undefined && (typeof initialDelayMs !== "number" || initialDelayMs < 0)) {
+    errors.push({
+      field: `${path}.initialDelayMs`,
+      message: `${path}.initialDelayMs cannot be negative.`,
+    });
+  }
+  if (maxDelayMs !== undefined && (typeof maxDelayMs !== "number" || maxDelayMs < 0)) {
+    errors.push({
+      field: `${path}.maxDelayMs`,
+      message: `${path}.maxDelayMs cannot be negative.`,
+    });
+  }
+  if (initialDelayMs !== undefined && maxDelayMs !== undefined && maxDelayMs < initialDelayMs) {
+    errors.push({
+      field: `${path}.maxDelayMs`,
+      message: `${path}.maxDelayMs must be greater than or equal to initialDelayMs.`,
+    });
+  }
+  if (backoffFactor !== undefined && (typeof backoffFactor !== "number" || backoffFactor < 1)) {
+    errors.push({
+      field: `${path}.backoffFactor`,
+      message: `${path}.backoffFactor must be at least 1.`,
+    });
+  }
+  if (jitterMs !== undefined && (typeof jitterMs !== "number" || jitterMs < 0)) {
+    errors.push({
+      field: `${path}.jitterMs`,
+      message: `${path}.jitterMs cannot be negative.`,
+    });
+  }
+  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || timeoutMs < 0)) {
+    errors.push({
+      field: `${path}.timeoutMs`,
+      message: `${path}.timeoutMs cannot be negative.`,
+    });
+  }
+
+  return errors;
+}
+
+/**
+ * Validates SDK configuration values such as network, RPC URL, contract IDs,
+ * artifact locations, retry policy, and feature flags.
+ *
+ * @param config - Partial configuration object to validate.
+ * @returns ConfigValidationResult containing boolean `isValid` and error details.
+ */
+export function validateConfig(config?: Partial<ClientConfig>): ConfigValidationResult {
+  const errors: ConfigValidationErrorDetail[] = [];
+
+  if (!config) {
+    return {
+      isValid: false,
+      errors: [{ field: "config", message: "Configuration object is required." }],
+    };
+  }
+
+  // 1. Validate RPC URL / networkUrl
+  const effectiveUrl = config.rpcUrl || config.networkUrl;
+  if (!effectiveUrl || effectiveUrl.trim() === "") {
+    errors.push({
+      field: "networkUrl",
+      message: "networkUrl (or rpcUrl) is required.",
+    });
+  } else {
+    try {
+      const parsedUrl = new URL(effectiveUrl);
+      if (!["http:", "https:", "ws:", "wss:"].includes(parsedUrl.protocol)) {
+        errors.push({
+          field: "networkUrl",
+          message: `networkUrl must use http, https, ws, or wss protocol: ${effectiveUrl}`,
+        });
+      }
+    } catch {
+      errors.push({
+        field: "networkUrl",
+        message: `networkUrl is malformed: ${effectiveUrl}`,
+      });
+    }
+  }
+
+  // 2. Validate network name/passphrase if specified
+  if (
+    config.network !== undefined &&
+    (typeof config.network !== "string" || config.network.trim() === "")
+  ) {
+    errors.push({
+      field: "network",
+      message: "network must be a non-empty string.",
+    });
+  }
+
+  // 3. Validate contract ID / contract IDs
+  const hasContractId = Boolean(config.contractId && config.contractId.trim() !== "");
+  const hasContractIds = Boolean(
+    config.contractIds &&
+    typeof config.contractIds === "object" &&
+    Object.keys(config.contractIds).length > 0
+  );
+
+  if (!hasContractId && !hasContractIds) {
+    errors.push({
+      field: "contractId",
+      message: "contractId (or contractIds) is required.",
+    });
+  } else {
+    if (hasContractId) {
+      if (!isValidContractId(config.contractId!)) {
+        errors.push({
+          field: "contractId",
+          message: `contractId is malformed: ${config.contractId}`,
+        });
+      }
+    }
+    if (hasContractIds) {
+      for (const [key, idVal] of Object.entries(config.contractIds!)) {
+        if (!isValidContractId(idVal)) {
+          errors.push({
+            field: `contractIds.${key}`,
+            message: `contractIds.${key} is malformed: ${idVal}`,
+          });
+        }
+      }
+    }
+  }
+
+  // 4. Validate proof artifact locations
+  if (config.proofConfig) {
+    if (!config.proofConfig.wasmUrl || config.proofConfig.wasmUrl.trim() === "") {
+      errors.push({
+        field: "proofConfig.wasmUrl",
+        message: "proofConfig.wasmUrl is required.",
+      });
+    }
+    if (!config.proofConfig.zkeyUrl || config.proofConfig.zkeyUrl.trim() === "") {
+      errors.push({
+        field: "proofConfig.zkeyUrl",
+        message: "proofConfig.zkeyUrl is required.",
+      });
+    }
+  }
+
+  // 5. Validate retry policy and per-operation retry budgets
+  if (config.retryPolicy) {
+    errors.push(...validateRetryPolicyConfig(config.retryPolicy, "retryPolicy"));
+  }
+  if (config.retryBudgets) {
+    const operations = ["read", "write", "poll"] as const;
+    for (const operation of operations) {
+      const operationPolicy = config.retryBudgets[operation];
+      if (operationPolicy) {
+        errors.push(...validateRetryPolicyConfig(operationPolicy, `retryBudgets.${operation}`));
+      }
+    }
+  }
+
+  // 6. Validate feature flags
+  if (config.featureFlags !== undefined) {
+    if (typeof config.featureFlags !== "object" || config.featureFlags === null) {
+      errors.push({
+        field: "featureFlags",
+        message: "featureFlags must be an object.",
+      });
+    } else {
+      for (const [flag, val] of Object.entries(config.featureFlags)) {
+        if (typeof val !== "boolean") {
+          errors.push({
+            field: `featureFlags.${flag}`,
+            message: `featureFlags.${flag} must be a boolean value.`,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+  };
+}
+
+/**
+ * Asserts that configuration is valid, returning the validated ClientConfig.
+ * Throws a structured ValidationError if validation fails.
+ *
+ * @param config - Partial configuration object.
+ * @throws {ValidationError} If validation fails.
+ */
+export function assertValidConfig(config?: Partial<ClientConfig>): ClientConfig {
+  const result = validateConfig(config);
+  if (!result.isValid) {
+    const errorMessages = result.errors.map((e) => `- ${e.message}`).join("\n");
+    const firstField = result.errors[0]?.field || "config";
+    throw new ValidationError(
+      `Configuration validation failed:\n${errorMessages}`,
+      firstField,
+      "CONFIG_VALIDATION_ERROR",
+      { errors: result.errors }
+    );
+  }
+
+  const effectiveUrl = config!.rpcUrl || config!.networkUrl!;
+  return {
+    networkUrl: effectiveUrl,
+    rpcUrl: config!.rpcUrl || effectiveUrl,
+    network: config!.network,
+    contractId:
+      config!.contractId || (config!.contractIds ? Object.values(config!.contractIds)[0] : ""),
+    contractIds: config!.contractIds,
+    adminKey: config!.adminKey,
+    proofConfig: config!.proofConfig,
+    retryPolicy: config!.retryPolicy,
+    retryBudgets: config!.retryBudgets,
+    featureFlags: config!.featureFlags,
+  };
 }
 
 export class ConfigBuilder {
   private _networkUrl?: string;
+  private _rpcUrl?: string;
+  private _network?: string;
   private _contractId?: string;
+  private _contractIds?: Record<string, string>;
   private _adminKey?: string;
   private _proofConfig?: ProofGeneratorConfig;
+  private _retryPolicy?: RetryPolicyConfig;
+  private _retryBudgets?: RetryBudgetsConfig;
+  private _featureFlags?: FeatureFlagsConfig;
 
   constructor(preset?: Partial<ClientConfig>) {
     if (preset) {
       this._networkUrl = preset.networkUrl;
+      this._rpcUrl = preset.rpcUrl;
+      this._network = preset.network;
       this._contractId = preset.contractId;
+      this._contractIds = preset.contractIds;
       this._adminKey = preset.adminKey;
       this._proofConfig = preset.proofConfig;
+      this._retryPolicy = preset.retryPolicy;
+      this._retryBudgets = preset.retryBudgets;
+      this._featureFlags = preset.featureFlags;
     }
   }
 
@@ -28,8 +337,23 @@ export class ConfigBuilder {
     return this;
   }
 
+  public withRpcUrl(url: string): this {
+    this._rpcUrl = url;
+    return this;
+  }
+
+  public withNetwork(network: string): this {
+    this._network = network;
+    return this;
+  }
+
   public withContractId(id: string): this {
     this._contractId = id;
+    return this;
+  }
+
+  public withContractIds(ids: Record<string, string>): this {
+    this._contractIds = ids;
     return this;
   }
 
@@ -43,39 +367,41 @@ export class ConfigBuilder {
     return this;
   }
 
+  public withRetryPolicy(policy: RetryPolicyConfig): this {
+    this._retryPolicy = policy;
+    return this;
+  }
+
+  public withRetryBudgets(budgets: RetryBudgetsConfig): this {
+    this._retryBudgets = budgets;
+    return this;
+  }
+
+  public withFeatureFlags(flags: FeatureFlagsConfig): this {
+    this._featureFlags = flags;
+    return this;
+  }
+
+  public validate(): ConfigValidationResult {
+    return validateConfig(this.toConfigObject());
+  }
+
   public build(): ClientConfig {
-    const errors: string[] = [];
+    return assertValidConfig(this.toConfigObject());
+  }
 
-    if (!this._networkUrl) {
-      errors.push("networkUrl is required.");
-    } else {
-      try {
-        new URL(this._networkUrl);
-      } catch {
-        errors.push(`networkUrl is malformed: ${this._networkUrl}`);
-      }
-    }
-
-    if (!this._contractId) {
-      errors.push("contractId is required.");
-    } else if (!StrKey.isValidContract(this._contractId)) {
-      errors.push(`contractId is malformed: ${this._contractId}`);
-    }
-
-    if (this._proofConfig) {
-      if (!this._proofConfig.wasmUrl) errors.push("proofConfig.wasmUrl is required.");
-      if (!this._proofConfig.zkeyUrl) errors.push("proofConfig.zkeyUrl is required.");
-    }
-
-    if (errors.length > 0) {
-      throw new Error(`Configuration validation failed:\n- ${errors.join("\n- ")}`);
-    }
-
+  private toConfigObject(): Partial<ClientConfig> {
     return {
-      networkUrl: this._networkUrl!,
-      contractId: this._contractId!,
+      networkUrl: this._networkUrl,
+      rpcUrl: this._rpcUrl,
+      network: this._network,
+      contractId: this._contractId,
+      contractIds: this._contractIds,
       adminKey: this._adminKey,
       proofConfig: this._proofConfig,
+      retryPolicy: this._retryPolicy,
+      retryBudgets: this._retryBudgets,
+      featureFlags: this._featureFlags,
     };
   }
 }
@@ -84,16 +410,22 @@ export const ConfigPresets = {
   local(): ConfigBuilder {
     return new ConfigBuilder({
       networkUrl: "http://localhost:8000",
+      rpcUrl: "http://localhost:8000",
+      network: "localnet",
     });
   },
   testnet(): ConfigBuilder {
     return new ConfigBuilder({
       networkUrl: "https://soroban-testnet.stellar.org",
+      rpcUrl: "https://soroban-testnet.stellar.org",
+      network: "testnet",
     });
   },
   production(): ConfigBuilder {
     return new ConfigBuilder({
       networkUrl: "https://soroban-rpc.mainnet.stellar.org",
+      rpcUrl: "https://soroban-rpc.mainnet.stellar.org",
+      network: "mainnet",
     });
   },
 };
@@ -101,5 +433,165 @@ export const ConfigPresets = {
 // Keep DEFAULT_CONFIG for backward compatibility, although users should migrate to presets
 export const DEFAULT_CONFIG: ClientConfig = {
   networkUrl: "https://soroban-testnet.stellar.org",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  network: "testnet",
   contractId: "",
 };
+
+/**
+ * Single deprecated field discovered while migrating a legacy config.
+ */
+export interface ConfigMigrationWarning {
+  /** The deprecated field name that was encountered. */
+  field: string;
+  /** Human-readable explanation of what changed and what to use instead. */
+  message: string;
+}
+
+/**
+ * Result of migrating a legacy config object into the current schema.
+ */
+export interface ConfigMigrationResult {
+  /** Best-effort config conforming to the current {@link ClientConfig} schema. */
+  config: ClientConfig;
+  /** Non-empty when deprecated fields were encountered and remapped. */
+  warnings: ConfigMigrationWarning[];
+  /** True when one or more deprecated fields were migrated. */
+  migrated: boolean;
+  /** Validation outcome of the migrated config. */
+  validation: ConfigValidationResult;
+}
+
+/**
+ * Map of deprecated legacy field names to their current replacement.
+ *
+ * Integrators who built against older SDK versions referenced these names.
+ * The migration helper remaps them and emits a warning so the change is
+ * never silent.
+ */
+const DEPRECATED_CONFIG_FIELDS: Record<string, { target: keyof ClientConfig; message: string }> = {
+  nodeUrl: {
+    target: "networkUrl",
+    message: "`nodeUrl` has been renamed to `networkUrl`.",
+  },
+  serverUrl: {
+    target: "networkUrl",
+    message: "`serverUrl` has been renamed to `networkUrl`.",
+  },
+  adminSecret: {
+    target: "adminKey",
+    message: "`adminSecret` has been renamed to `adminKey`.",
+  },
+  signingKey: {
+    target: "adminKey",
+    message: "`signingKey` has been renamed to `adminKey`.",
+  },
+  contractAddress: {
+    target: "contractId",
+    message: "`contractAddress` has been renamed to `contractId`.",
+  },
+};
+
+function buildClientConfig(source: Record<string, unknown>): ClientConfig {
+  return {
+    networkUrl: (source.networkUrl as string) ?? "",
+    rpcUrl: (source.rpcUrl as string) ?? (source.networkUrl as string) ?? "",
+    network: (source.network as string) ?? undefined,
+    contractId: (source.contractId as string) ?? "",
+    contractIds: source.contractIds as Record<string, string> | undefined,
+    adminKey: (source.adminKey as string) ?? undefined,
+    proofConfig: source.proofConfig as ProofGeneratorConfig | undefined,
+    retryPolicy: source.retryPolicy as RetryPolicyConfig | undefined,
+    retryBudgets: source.retryBudgets as RetryBudgetsConfig | undefined,
+    featureFlags: source.featureFlags as FeatureFlagsConfig | undefined,
+  };
+}
+
+/**
+ * Inspects a legacy config object and reports any deprecated fields without
+ * mutating or rebuilding the config.
+ *
+ * @example
+ * const warnings = detectDeprecatedConfigFields(oldConfig);
+ * for (const w of warnings) console.warn(`${w.field}: ${w.message}`);
+ */
+export function detectDeprecatedConfigFields(
+  input: Record<string, unknown>
+): ConfigMigrationWarning[] {
+  const warnings: ConfigMigrationWarning[] = [];
+
+  for (const [deprecated, info] of Object.entries(DEPRECATED_CONFIG_FIELDS)) {
+    if (input[deprecated] !== undefined && input[deprecated] !== null) {
+      warnings.push({ field: deprecated, message: info.message });
+    }
+  }
+
+  if (input.networkUrl === undefined && input.rpcUrl !== undefined) {
+    warnings.push({
+      field: "rpcUrl",
+      message:
+        "`rpcUrl` is deprecated as the primary endpoint; `networkUrl` is now preferred (rpcUrl is still accepted).",
+    });
+  }
+
+  return warnings;
+}
+
+/**
+ * Migrates an older SDK config object to the current {@link ClientConfig}
+ * schema, remapping deprecated fields and collecting warnings for each one.
+ *
+ * The helper is backward-compatible: configs that already use the current
+ * schema pass through unchanged (with an empty warning list). Deprecated
+ * fields are remapped only when the replacement is not already set, so an
+ * explicit current value always wins over a legacy alias.
+ *
+ * @param input - A legacy or current config object.
+ * @returns The migrated config plus any deprecation warnings.
+ *
+ * @example
+ * const { config, warnings } = migrateConfig(oldConfig);
+ * if (warnings.length) console.warn("Config migrated:", warnings);
+ */
+export function migrateConfig(input: Record<string, unknown>): ConfigMigrationResult {
+  const source: Record<string, unknown> = { ...input };
+  const result: Record<string, unknown> = {};
+  const warnings: ConfigMigrationWarning[] = [];
+
+  // Copy current-schema fields first so an explicit value always wins over
+  // a legacy alias remapped below.
+  for (const [key, value] of Object.entries(source)) {
+    if (!(key in DEPRECATED_CONFIG_FIELDS)) {
+      result[key] = value;
+    }
+  }
+
+  // Remap deprecated aliases only when the replacement is not already set.
+  for (const [deprecated, info] of Object.entries(DEPRECATED_CONFIG_FIELDS)) {
+    if (source[deprecated] !== undefined && source[deprecated] !== null) {
+      if (result[info.target] === undefined) {
+        result[info.target] = source[deprecated];
+      }
+      warnings.push({ field: deprecated, message: info.message });
+    }
+  }
+
+  if (result.networkUrl === undefined && result.rpcUrl !== undefined) {
+    result.networkUrl = result.rpcUrl;
+    warnings.push({
+      field: "rpcUrl",
+      message:
+        "`rpcUrl` is deprecated as the primary endpoint; `networkUrl` is now preferred (rpcUrl is still accepted).",
+    });
+  }
+
+  const validation = validateConfig(result as Partial<ClientConfig>);
+  const config = buildClientConfig(result);
+
+  return {
+    config,
+    warnings,
+    migrated: warnings.length > 0,
+    validation,
+  };
+}

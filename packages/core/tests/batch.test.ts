@@ -2,6 +2,7 @@ import {
   BatchPayloadBuilder,
   BatchValidationFailedError,
   BatchPaymentEntry,
+  validateBatchPayload,
 } from "../src/batch/BatchPayloadBuilder";
 
 const validEntry: BatchPaymentEntry = {
@@ -186,6 +187,31 @@ describe("BatchPayloadBuilder", () => {
     it("has code BATCH_VALIDATION_FAILED", () => {
       const err = new BatchValidationFailedError([]);
       expect(err.code).toBe("BATCH_VALIDATION_FAILED");
+    });
+  });
+
+  describe("validateBatchPayload helper", () => {
+    it("validates valid array of entries", () => {
+      const errors = validateBatchPayload([validEntry]);
+      expect(errors).toHaveLength(0);
+    });
+
+    it("detects empty batch", () => {
+      const errors = validateBatchPayload([]);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].code).toBe("EMPTY_BATCH");
+    });
+
+    it("detects duplicate recipients and invalid amount", () => {
+      const errors = validateBatchPayload([
+        { recipient: "GA1", amount: 100n, asset: "native" },
+        { recipient: "GA1", amount: -5n, asset: "native" },
+      ]);
+      const dup = errors.find((e) => e.code === "DUPLICATE_RECIPIENT");
+      const invAmt = errors.find((e) => e.code === "INVALID_AMOUNT");
+      expect(dup).toBeDefined();
+      expect(invAmt).toBeDefined();
+      expect(invAmt?.index).toBe(1);
     });
   });
 });

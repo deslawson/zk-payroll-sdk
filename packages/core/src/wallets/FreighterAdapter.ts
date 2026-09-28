@@ -6,6 +6,7 @@ import {
   SignedTransaction,
   WalletError,
   WalletErrorCode,
+  WalletRejectionError,
 } from "./IWalletAdapter";
 
 /**
@@ -58,10 +59,10 @@ export class FreighterAdapter implements IWalletAdapter {
       const address = await this.getFreighterApi().getAddress();
 
       if (!address) {
-        throw new WalletError(
+        throw new WalletRejectionError(
           "Failed to get address from Freighter",
-          WalletErrorCode.CONNECTION_REJECTED,
-          this.id
+          this.id,
+          WalletErrorCode.CONNECTION_REJECTED
         );
       }
 
@@ -93,7 +94,9 @@ export class FreighterAdapter implements IWalletAdapter {
       throw new WalletError(
         `Failed to connect to Freighter: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }
@@ -114,7 +117,11 @@ export class FreighterAdapter implements IWalletAdapter {
       const signedXdr = await this.getFreighterApi().signXDR(xdr);
 
       if (!signedXdr) {
-        throw new WalletError("User rejected signing", WalletErrorCode.SIGNING_REJECTED, this.id);
+        throw new WalletRejectionError(
+          "User rejected signing",
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED
+        );
       }
 
       return {
@@ -129,7 +136,9 @@ export class FreighterAdapter implements IWalletAdapter {
       throw new WalletError(
         `Failed to sign transaction: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }
@@ -143,10 +152,10 @@ export class FreighterAdapter implements IWalletAdapter {
       const result = await this.getFreighterApi().signAndSubmitXDR(xdr);
 
       if (!result) {
-        throw new WalletError(
+        throw new WalletRejectionError(
           "User rejected signing or submission failed",
-          WalletErrorCode.SIGNING_REJECTED,
-          this.id
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED
         );
       }
 
@@ -160,7 +169,9 @@ export class FreighterAdapter implements IWalletAdapter {
       throw new WalletError(
         `Failed to sign and submit transaction: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }

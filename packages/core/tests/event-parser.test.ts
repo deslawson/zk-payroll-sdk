@@ -1,4 +1,4 @@
-import { xdr, nativeToScVal, Address, StrKey } from "@stellar/stellar-sdk";
+import { xdr, nativeToScVal, Address, StrKey, Keypair } from "@stellar/stellar-sdk";
 import {
   parseContractEvent,
   parseContractEvents,
@@ -7,10 +7,10 @@ import {
 } from "../src/event-parser";
 
 const TEST_CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32, 1));
-const TEST_EMPLOYER = "GBAOQHHA5HX4JQ4C5V6Z5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5";
-const TEST_EMPLOYEE = "GBAOQHHA5HX4JQ4C5V6Z5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q6";
+const TEST_EMPLOYER = Keypair.random().publicKey();
+const TEST_EMPLOYEE = Keypair.random().publicKey();
 const TEST_TOKEN_ID = StrKey.encodeContract(Buffer.alloc(32, 2));
-const TEST_RECIPIENT = "GBAOQHHA5HX4JQ4C5V6Z5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q7";
+const TEST_RECIPIENT = Keypair.random().publicKey();
 
 function makeEventScValMap(entries: Record<string, xdr.ScVal>): xdr.ScVal {
   return xdr.ScVal.scvMap(
@@ -37,7 +37,7 @@ function u64ScVal(value: bigint): xdr.ScVal {
 }
 
 function bytesScVal(hex: string): xdr.ScVal {
-  return nativeToScVal(Buffer.from(hex, "hex"), { type: "bytes" });
+  return xdr.ScVal.scvBytes(Buffer.from(hex, "hex"));
 }
 
 function symbolScVal(name: string): xdr.ScVal {
@@ -46,7 +46,7 @@ function symbolScVal(name: string): xdr.ScVal {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeRawEvent(overrides: Partial<RawContractEvent>): RawContractEvent {
+function _makeRawEvent(overrides: Partial<RawContractEvent>): RawContractEvent {
   return {
     topics: [],
     data: xdr.ScVal.scvVoid(),
@@ -60,11 +60,7 @@ function makeRawEvent(overrides: Partial<RawContractEvent>): RawContractEvent {
 
 describe("parseContractEvent — registered", () => {
   const raw: RawContractEvent = {
-    topics: [
-      symbolScVal("registered"),
-      addressScVal(TEST_EMPLOYER),
-      addressScVal(TEST_EMPLOYEE),
-    ],
+    topics: [symbolScVal("registered"), addressScVal(TEST_EMPLOYER), addressScVal(TEST_EMPLOYEE)],
     data: makeEventScValMap({
       salary: i128ScVal(1000n),
       token: addressScVal(TEST_TOKEN_ID),
@@ -90,11 +86,7 @@ describe("parseContractEvent — registered", () => {
 
   it("handles missing optional metadata", () => {
     const minimal: RawContractEvent = {
-      topics: [
-        symbolScVal("registered"),
-        addressScVal(TEST_EMPLOYER),
-        addressScVal(TEST_EMPLOYEE),
-      ],
+      topics: [symbolScVal("registered"), addressScVal(TEST_EMPLOYER), addressScVal(TEST_EMPLOYEE)],
       data: makeEventScValMap({
         salary: i128ScVal(500n),
         token: addressScVal(TEST_TOKEN_ID),
@@ -175,11 +167,7 @@ describe("parseContractEvent — registry_deactivated", () => {
 
 describe("parseContractEvent — committed", () => {
   const raw: RawContractEvent = {
-    topics: [
-      symbolScVal("committed"),
-      addressScVal(TEST_EMPLOYER),
-      addressScVal(TEST_EMPLOYEE),
-    ],
+    topics: [symbolScVal("committed"), addressScVal(TEST_EMPLOYER), addressScVal(TEST_EMPLOYEE)],
     data: makeEventScValMap({
       commitment_hash: bytesScVal("abcd1234"),
       cycle_id: u64ScVal(3n),
@@ -302,10 +290,7 @@ describe("parseContractEvent — payment_cancelled", () => {
   });
 
   it("falls back to topic when payment_id is not in data map", () => {
-    const fallbackTopics = [
-      symbolScVal("payment_cancelled"),
-      u64ScVal(88n),
-    ];
+    const fallbackTopics = [symbolScVal("payment_cancelled"), u64ScVal(88n)];
     const raw: RawContractEvent = {
       topics: fallbackTopics,
       data: xdr.ScVal.scvVoid(),
@@ -323,9 +308,9 @@ describe("parseContractEvent — payment_cancelled", () => {
 
 describe("parseContractEvent — error handling", () => {
   it("throws EventParsingError for empty topics", () => {
-    expect(() =>
-      parseContractEvent({ topics: [], data: xdr.ScVal.scvVoid() })
-    ).toThrow(EventParsingError);
+    expect(() => parseContractEvent({ topics: [], data: xdr.ScVal.scvVoid() })).toThrow(
+      EventParsingError
+    );
   });
 
   it("throws EventParsingError for unknown event type", () => {
@@ -402,7 +387,11 @@ describe("parseContractEvents", () => {
     expect(() =>
       parseContractEvents([
         {
-          topics: [symbolScVal("registered"), addressScVal(TEST_EMPLOYER), addressScVal(TEST_EMPLOYEE)],
+          topics: [
+            symbolScVal("registered"),
+            addressScVal(TEST_EMPLOYER),
+            addressScVal(TEST_EMPLOYEE),
+          ],
           data: makeEventScValMap({ salary: i128ScVal(1000n), token: addressScVal(TEST_TOKEN_ID) }),
         },
         { topics: [], data: xdr.ScVal.scvVoid() },
@@ -420,10 +409,7 @@ describe("RawContractEvent compatibility", () => {
     const event: RawContractEvent = {
       eventType: "contract",
       contractId: TEST_CONTRACT_ID,
-      topics: [
-        symbolScVal("payment_executed"),
-        addressScVal(TEST_RECIPIENT),
-      ],
+      topics: [symbolScVal("payment_executed"), addressScVal(TEST_RECIPIENT)],
       data: makeEventScValMap({
         amount: i128ScVal(500n),
         asset: addressScVal(TEST_TOKEN_ID),
@@ -440,5 +426,3 @@ describe("RawContractEvent compatibility", () => {
     }
   });
 });
-
-

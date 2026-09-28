@@ -23,10 +23,7 @@ export interface RetryDecision {
   reason: string;
 }
 
-function decision(
-  category: RetryCategoryType,
-  reason: string
-): RetryDecision {
+function decision(category: RetryCategoryType, reason: string): RetryDecision {
   return {
     category,
     retryable: category === RetryCategory.RETRYABLE,
@@ -34,10 +31,7 @@ function decision(
   };
 }
 
-export function classifyError(
-  error: unknown,
-  _context?: ErrorContext
-): RetryDecision {
+export function classifyError(error: unknown, _context?: ErrorContext): RetryDecision {
   if (error instanceof NetworkError) {
     return classifyNetworkError(error);
   }
@@ -78,10 +72,7 @@ export function classifyError(
     return classifyGenericError(error);
   }
 
-  return decision(
-    RetryCategory.UNKNOWN,
-    "Non-Error thrown value — cannot determine retryability"
-  );
+  return decision(RetryCategory.UNKNOWN, "Non-Error thrown value — cannot determine retryability");
 }
 
 function classifyNetworkError(error: NetworkError): RetryDecision {
@@ -95,17 +86,11 @@ function classifyNetworkError(error: NetworkError): RetryDecision {
   }
 
   if (code >= 500) {
-    return decision(
-      RetryCategory.RETRYABLE,
-      `Server error (HTTP ${code}) — may succeed on retry`
-    );
+    return decision(RetryCategory.RETRYABLE, `Server error (HTTP ${code}) — may succeed on retry`);
   }
 
   if (code === 429) {
-    return decision(
-      RetryCategory.RETRYABLE,
-      "Rate limited (HTTP 429) — retry after backoff"
-    );
+    return decision(RetryCategory.RETRYABLE, "Rate limited (HTTP 429) — retry after backoff");
   }
 
   if (code >= 400) {
@@ -115,10 +100,7 @@ function classifyNetworkError(error: NetworkError): RetryDecision {
     );
   }
 
-  return decision(
-    RetryCategory.UNKNOWN,
-    `Unexpected HTTP status (${code}) — retry with caution`
-  );
+  return decision(RetryCategory.UNKNOWN, `Unexpected HTTP status (${code}) — retry with caution`);
 }
 
 function classifyContractError(error: ContractExecutionError): RetryDecision {
@@ -192,14 +174,99 @@ function classifyGenericError(error: Error): RetryDecision {
   }
 
   if (error.name === "AbortError" || error.name === "TimeoutError") {
-    return decision(
-      RetryCategory.RETRYABLE,
-      "Request aborted or timed out — retryable"
-    );
+    return decision(RetryCategory.RETRYABLE, "Request aborted or timed out — retryable");
   }
 
   return decision(
     RetryCategory.UNKNOWN,
     "Generic Error without known retryable markers — retry with caution"
   );
+}
+
+export interface RetryOptions {
+  attempts?: number;
+  delayMs?: number;
+  backoffFactor?: number;
+  /**
+   * Overall deadline in milliseconds, measured from the first attempt. Once
+   * exceeded, `withRetry` stops retrying and throws the most recent error
+   * (or a RetryTimeoutError if no attempt has been made yet). Unset by
+   * default — only `attempts` bounds the loop.
+   */
+  timeoutMs?: number;
+  /**
+   * Called with the number of attempts already made when a retry is about
+   * to be scheduled (i.e. the previous attempt failed and another is
+   * coming). Not called before the first attempt or after the final one.
+   */
+  onRetry?: (attempt: number, error: unknown, decision: RetryDecision) => void;
+}
+
+/**
+ * Thrown when a retry loop's overall timeoutMs deadline is exceeded before
+ * any attempt could run at all (e.g. timeoutMs is smaller than a single
+ * backoff delay).
+ */
+export class RetryTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Retry deadline of ${timeoutMs}ms exceeded before any attempt completed`);
+    this.name = "RetryTimeoutError";
+  }
+}
+
+/**
+ * Runs `fn`, retrying on failure per `options`.
+ *
+ * Retry continuation is gated by `classifyError`: a NON_RETRYABLE error
+ * (e.g. a contract revert, a validation error, an insufficient-fee
+ * rejection) stops the loop immediately and rethrows, regardless of
+ * remaining attempts — retrying those can never succeed and, for unsafe
+ * write/signing operations in particular, risks duplicate submission for
+ * no benefit. RETRYABLE and UNKNOWN classifications continue retrying as
+ * before.
+ *
+ * Passing `attempts: 1` effectively disables retrying (the loop runs `fn`
+ * once and rethrows on failure without ever consulting classifyError,
+ * since there is no further attempt to gate).
+ */
+export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const attempts = options.attempts ?? 3;
+  const delayMs = options.delayMs ?? 100;
+  const backoffFactor = options.backoffFactor ?? 2;
+  const timeoutMs = options.timeoutMs;
+
+  const startedAt = Date.now();
+  let currentDelay = delayMs;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (timeoutMs !== undefined && Date.now() - startedAt >= timeoutMs) {
+      throw lastError ?? new RetryTimeoutError(timeoutMs);
+    }
+
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      if (attempt === attempts) break;
+
+      const retryDecision = classifyError(err);
+      if (retryDecision.category === RetryCategory.NON_RETRYABLE) {
+        options.onRetry?.(attempt, err, retryDecision);
+        throw err;
+      }
+
+      options.onRetry?.(attempt, err, retryDecision);
+
+      if (timeoutMs !== undefined && Date.now() - startedAt + currentDelay >= timeoutMs) {
+        throw lastError;
+      }
+
+      await new Promise((res) => setTimeout(res, currentDelay));
+      currentDelay *= backoffFactor;
+    }
+  }
+
+  throw lastError;
 }

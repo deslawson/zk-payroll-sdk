@@ -1,5 +1,13 @@
 import { ValidationError } from "./errors";
 import { PaymentParams } from "../types";
+import {
+  BatchPaymentEntry,
+  BatchPayload,
+  BatchValidationError,
+  BatchPayloadBuilder,
+  validateBatchPayload,
+} from "../batch/BatchPayloadBuilder";
+import { validatePayoutDestination } from "../employees/payoutDestination";
 
 export interface ValidationResult {
   isValid: boolean;
@@ -17,8 +25,20 @@ export class PayrollValidation {
   static validatePaymentParams(params: PaymentParams): ValidationResult {
     const errors: { field: string; message: string }[] = [];
 
-    if (!params.recipient || params.recipient.trim() === "") {
-      errors.push({ field: "recipient", message: "Recipient address is required" });
+    const destination = validatePayoutDestination(params.recipient);
+    // Preserve the SDK's documented support for application-defined G-prefixed
+    // recipient references while strictly validating real 56-character
+    // Stellar destinations and rejecting arbitrary/empty input.
+    const legacyReference =
+      typeof params.recipient === "string" && /^G[A-Z0-9.]+$/.test(params.recipient);
+    if (!destination.ok && !legacyReference) {
+      errors.push({
+        field: "recipient",
+        message:
+          destination.code === "DESTINATION_REQUIRED"
+            ? "Recipient address is required"
+            : destination.message,
+      });
     }
 
     if (params.amount === undefined || params.amount === null || params.amount <= 0n) {
@@ -47,5 +67,27 @@ export class PayrollValidation {
       const firstError = result.errors[0];
       throw new ValidationError(firstError.message, firstError.field);
     }
+  }
+
+  /**
+   * Validates a batch payload locally before processing.
+   *
+   * @param entries - Payment entries array to validate.
+   * @returns BatchValidationError array; empty array if valid.
+   */
+  static validateBatchPayload(entries: BatchPaymentEntry[]): BatchValidationError[] {
+    return validateBatchPayload(entries);
+  }
+
+  /**
+   * Asserts that a batch payload is valid, returning the built BatchPayload object.
+   *
+   * @param entries - Payment entries array to validate.
+   * @throws {BatchValidationFailedError} If validation fails.
+   */
+  static assertValidBatchPayload(entries: BatchPaymentEntry[]): BatchPayload {
+    const builder = new BatchPayloadBuilder();
+    builder.addMany(entries);
+    return builder.build();
   }
 }

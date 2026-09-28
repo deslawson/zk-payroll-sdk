@@ -2,7 +2,13 @@ import { Keypair, Networks, xdr } from "@stellar/stellar-sdk";
 import { PayrollService } from "../src/payroll";
 import { PayrollContractWrapper } from "../src/adapters/PayrollContractWrapper";
 import { IProofGenerator, ProofPayload } from "../src/crypto/IProofGenerator";
-import { PayrollError, PayrollServiceErrorCode } from "../src/errors";
+import {
+  PayrollError,
+  PayrollServiceErrorCode,
+  ContractExecutionError,
+  ContractErrorCode,
+} from "../src/errors";
+import type { SdkLogger } from "../src/logging/SdkLogger";
 
 const MOCK_PROOF: ProofPayload = {
   proof: {
@@ -286,6 +292,135 @@ describe("PayrollService", () => {
           asset: "native",
         })
       ).rejects.toBe(customError);
+    });
+  });
+
+  describe("contract-state gating (#145)", () => {
+    function createMockLogger(): SdkLogger {
+      return {
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      } as unknown as SdkLogger;
+    }
+
+    it("propagates a CONTRACT_REVERT from an invalid company/payroll state unchanged", async () => {
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      const stateError = new ContractExecutionError(
+        'Contract reverted during "private_pay": {"reason":"CompanyNotActive"}',
+        ContractErrorCode.CONTRACT_REVERT,
+        { requestId: "req-1" }
+      );
+      (mockWrapper.privatePay as jest.Mock).mockRejectedValue(stateError);
+      const service = new PayrollService(mockWrapper, mockProofGen, signer);
+
+      await expect(
+        service.processPayment({ recipient: "GABC123", amount: 100n, asset: "native" })
+      ).rejects.toBe(stateError);
+    });
+
+    it("preserves the ContractExecutionError type and CONTRACT_REVERT code for consumers", async () => {
+      expect.assertions(2);
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      const stateError = new ContractExecutionError(
+        "company is paused",
+        ContractErrorCode.CONTRACT_REVERT
+      );
+      (mockWrapper.privatePay as jest.Mock).mockRejectedValue(stateError);
+      const service = new PayrollService(mockWrapper, mockProofGen, signer);
+
+      await service
+        .processPayment({ recipient: "GABC123", amount: 100n, asset: "native" })
+        .catch((err) => {
+          expect(err).toBeInstanceOf(ContractExecutionError);
+          expect((err as ContractExecutionError).code).toBe(ContractErrorCode.CONTRACT_REVERT);
+        });
+    });
+
+    it("logs the failure via the SDK logger before rethrowing, for observability", async () => {
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      const stateError = new ContractExecutionError(
+        "company is paused",
+        ContractErrorCode.CONTRACT_REVERT
+      );
+      (mockWrapper.privatePay as jest.Mock).mockRejectedValue(stateError);
+      const logger = createMockLogger();
+      const service = new PayrollService(
+        mockWrapper,
+        mockProofGen,
+        signer,
+        Networks.TESTNET,
+        logger
+      );
+
+      await expect(
+        service.processPayment({ recipient: "GABC123", amount: 100n, asset: "native" })
+      ).rejects.toBe(stateError);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        "contract_invocation_failed",
+        expect.objectContaining({
+          method: "private_pay",
+          error: "company is paused",
+          code: ContractErrorCode.CONTRACT_REVERT,
+        })
+      );
+    });
+
+    it("does not emit the submission_done progress event when the contract call is rejected", async () => {
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      (mockWrapper.privatePay as jest.Mock).mockRejectedValue(
+        new ContractExecutionError("company is paused", ContractErrorCode.CONTRACT_REVERT)
+      );
+      const service = new PayrollService(mockWrapper, mockProofGen, signer);
+      const onProgress = jest.fn();
+
+      await expect(
+        service.processPayment({
+          recipient: "GABC123",
+          amount: 100n,
+          asset: "native",
+          onProgress,
+        })
+      ).rejects.toThrow();
+
+      const stages = onProgress.mock.calls.map((call) => call[0].stage);
+      expect(stages).toContain("submission_preparing");
+      expect(stages).not.toContain("submission_done");
+    });
+
+    it("also propagates non-state contract failures (e.g. TRANSACTION_TIMEOUT) the same way", async () => {
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      const timeoutError = new ContractExecutionError(
+        "Transaction timed out after 15 polls",
+        ContractErrorCode.TRANSACTION_TIMEOUT
+      );
+      (mockWrapper.privatePay as jest.Mock).mockRejectedValue(timeoutError);
+      const service = new PayrollService(mockWrapper, mockProofGen, signer);
+
+      await expect(
+        service.processPayment({ recipient: "GABC123", amount: 100n, asset: "native" })
+      ).rejects.toBe(timeoutError);
+    });
+
+    it("does not log an error and does call payment_complete on a successful invocation", async () => {
+      const { mockWrapper, mockProofGen, signer } = createMocks();
+      const logger = createMockLogger();
+      const service = new PayrollService(
+        mockWrapper,
+        mockProofGen,
+        signer,
+        Networks.TESTNET,
+        logger
+      );
+
+      await service.processPayment({ recipient: "GABC123", amount: 100n, asset: "native" });
+
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.info).toHaveBeenCalledWith(
+        "payment_complete",
+        expect.objectContaining({ txHash: expect.any(String) })
+      );
     });
   });
 

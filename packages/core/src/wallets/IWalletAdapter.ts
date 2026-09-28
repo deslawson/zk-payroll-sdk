@@ -123,5 +123,5 @@ export interface IWalletAdapter {
   onAccountChange(callback: (publicKey: string) => void): () => void;
 }
 
-import { WalletError, WalletErrorCode } from "../errors";
-export { WalletError, WalletErrorCode };
+import { WalletError, WalletErrorCode, WalletRejectionError } from "../errors";
+export { WalletError, WalletErrorCode, WalletRejectionError };

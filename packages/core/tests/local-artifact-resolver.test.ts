@@ -216,8 +216,8 @@ describe("LocalArtifactResolver", () => {
       try {
         await resolver.resolve();
         fail("Expected error");
-      } catch (err: any) {
-        expect(err.code).toBe(ArtifactErrorCode.ARTIFACT_NOT_FOUND);
+      } catch (err: unknown) {
+        expect((err as { code: string }).code).toBe(ArtifactErrorCode.ARTIFACT_NOT_FOUND);
       }
     });
 
@@ -233,8 +233,8 @@ describe("LocalArtifactResolver", () => {
       try {
         await resolver.resolve();
         fail("Expected error");
-      } catch (err: any) {
-        expect(err.code).toBe(ArtifactErrorCode.ARTIFACT_CORRUPT);
+      } catch (err: unknown) {
+        expect((err as { code: string }).code).toBe(ArtifactErrorCode.ARTIFACT_CORRUPT);
       }
     });
   });
@@ -367,7 +367,9 @@ describe("SnarkjsProofGenerator — local artifact resolution", () => {
       zkeyUrl: zkeyPath,
     });
 
-    await expect(generator.generateProof({ test: "missing" })).rejects.toThrow(/Proof generation failed/);
+    await expect(generator.generateProof({ test: "missing" })).rejects.toThrow(
+      /Proof generation failed/
+    );
   });
 
   it("preload works with local artifacts", async () => {

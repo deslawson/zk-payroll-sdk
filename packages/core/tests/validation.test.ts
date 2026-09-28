@@ -39,4 +39,33 @@ describe("PayrollValidation", () => {
     expect(result.isValid).toBe(false);
     expect(result.errors).toContainEqual(expect.objectContaining({ field: "asset" }));
   });
+
+  describe("batch validation", () => {
+    it("should validate a valid batch payload", () => {
+      const entries = [
+        { recipient: "GA1", amount: 100n, asset: "native" },
+        { recipient: "GB2", amount: 200n, asset: "native" },
+      ];
+      const errors = PayrollValidation.validateBatchPayload(entries);
+      expect(errors).toHaveLength(0);
+
+      const built = PayrollValidation.assertValidBatchPayload(entries);
+      expect(built.entries).toHaveLength(2);
+      expect(built.totalAmount).toBe(300n);
+    });
+
+    it("should reject invalid batch payload with structured errors", () => {
+      const entries = [
+        { recipient: "GA1", amount: 100n, asset: "native" },
+        { recipient: "GA1", amount: 0n, asset: "" },
+      ];
+      const errors = PayrollValidation.validateBatchPayload(entries);
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors.some((e) => e.code === "DUPLICATE_RECIPIENT")).toBe(true);
+      expect(errors.some((e) => e.code === "INVALID_AMOUNT")).toBe(true);
+      expect(errors.some((e) => e.code === "MISSING_ASSET")).toBe(true);
+
+      expect(() => PayrollValidation.assertValidBatchPayload(entries)).toThrow();
+    });
+  });
 });

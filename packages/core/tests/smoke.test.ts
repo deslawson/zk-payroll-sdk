@@ -248,11 +248,13 @@ describe("Smoke: Local Demo Deployment", () => {
       expect(typeof result.txHash).toBe("string");
       expect(result.publicSignals).toEqual(["sig_1", "sig_2"]);
 
-      expect(mockProofGen.generateProof).toHaveBeenCalledWith({
-        recipient: "GPAYEE1234567890123456789012345678901234",
-        amount: "2500000",
-        asset: "native",
-      });
+      expect((mockProofGen.generateProof as jest.Mock).mock.calls[0][0]).toEqual(
+        expect.objectContaining({
+          recipient: "GPAYEE1234567890123456789012345678901234",
+          amount: "2500000",
+          asset: "native",
+        })
+      );
 
       const wrapperMock = mockWrapper.privatePay as jest.Mock;
       expect(wrapperMock).toHaveBeenCalledTimes(1);

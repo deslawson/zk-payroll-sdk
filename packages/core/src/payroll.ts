@@ -1,13 +1,70 @@
-import { Keypair, Networks } from "@stellar/stellar-sdk";
+import { Keypair, Networks, xdr } from "@stellar/stellar-sdk";
 import type { ISigner } from "./signer/types";
 import { toISigner } from "./signer/KeypairSigner";
 import { PayrollContractWrapper } from "./adapters/PayrollContractWrapper";
 import { IProofGenerator, ProofPayload } from "./crypto/IProofGenerator";
-import { PayrollError, PayrollServiceErrorCode } from "./errors";
+import { PayrollError, PayrollServiceErrorCode, ZkPayrollError } from "./errors";
 import { PaymentParams, PaymentResult } from "./types";
 import { SdkLogger } from "./logging/SdkLogger";
+import type { ServerCacheAdapter } from "./cache/ServerCacheAdapter";
+import { CacheNamespace } from "./cache/types";
+import type { EmployerUpdatedEvent } from "./events/employerUpdated";
+import { redactError } from "./redaction/RedactionEngine";
 import { IdempotencyRegistry, createPaymentIdempotencyKey } from "./core/idempotency";
 import { createPayrollProgressEvent } from "./progress";
+import { assertValidPayrollWitness } from "./crypto/proofInputSanitizer";
+import { iterateBatches } from "./batch/paginate";
+import type { BatchPayload } from "./batch/BatchPayloadBuilder";
+import {
+  createPayrollReceipt,
+  verifyPayrollReceipt,
+  assertValidPayrollReceipt,
+} from "./receipts/receiptVerifier";
+import type {
+  PayrollReceipt,
+  ReceiptVerificationOptions,
+  ReceiptVerificationResult,
+  CreatePayrollReceiptParams,
+} from "./receipts/types";
+import {
+  submitSequentialPayrollBatches,
+  type SafeBatchSubmissionOptions,
+  type SafeBatchSubmissionResult,
+  type SafeBatchProgressEvent,
+  type SafeBatchProgressStage,
+  type SafeBatchErrorDetail,
+} from "./payroll/safeBatchSubmitter";
+import {
+  validateSettlementReceipt as validateSettlementReceiptHelper,
+  type SettlementReceiptValidation,
+  type SettlementReceiptValidationOptions,
+} from "./settlement/receipt";
+import {
+  validatePaymentDestination,
+  getRegisteredDestinationValidationHook,
+  setDestinationValidationHook,
+  resetDestinationValidationHook,
+  type DestinationWorkflowValidation,
+} from "./settlement/destination";
+import type { DestinationValidationHook } from "./employees/payoutDestination";
+
+export {
+  submitSequentialPayrollBatches,
+  type SafeBatchSubmissionOptions,
+  type SafeBatchSubmissionResult,
+  type SafeBatchProgressEvent,
+  type SafeBatchProgressStage,
+  type SafeBatchErrorDetail,
+};
+
+import {
+  filterActiveRuns,
+  filterArchivedRuns,
+  filterDisputedRuns,
+  filterFinalizedRuns,
+  filterHeldRuns,
+  PayrollRunItem,
+} from "./archive";
 
 export interface Transaction {
   amount: bigint;
@@ -36,7 +93,8 @@ export class PayrollService {
     private readonly proofGenerator: IProofGenerator,
     signer: Keypair | ISigner,
     private readonly network: string = Networks.TESTNET,
-    private readonly logger?: SdkLogger
+    private readonly logger?: SdkLogger,
+    private readonly cache?: ServerCacheAdapter
   ) {
     this.signer = toISigner(signer);
   }
@@ -96,12 +154,46 @@ export class PayrollService {
       throw error;
     }
 
+    // 1b. Destination validation extension point (#531)
+    // Runs organizational destination policy (if a hook is registered) after
+    // built-in validation and before any proof generation or submission.
+    // The error path is sanitized through redactError() so the rejected
+    // destination can never surface in logs or events.
+    const destinationCheck = await validatePaymentDestination(recipient);
+    if (!destinationCheck.ok) {
+      const destinationError = new PayrollError(
+        destinationCheck.message,
+        PayrollServiceErrorCode.INVALID_RECIPIENT
+      );
+      this.logger?.warn("payment_destination_rejected", {
+        code: destinationCheck.code,
+        state: destinationCheck.state,
+        error: redactError(destinationError).message,
+      });
+      params.onProgress?.(
+        createPayrollProgressEvent({
+          operation: "payment",
+          stage: "validation",
+          message: "destination_validation_failed",
+          progress: 100,
+          metadata: { code: destinationCheck.code },
+        })
+      );
+      throw destinationError;
+    }
+
     // 2. Generate ZK proof
-    const witness: Record<string, unknown> = {
+    // Build witness then sanitize it with payroll-specific validation
+    // (required fields enforced; forbidden fields rejected; amounts normalized).
+    const rawWitness: Record<string, unknown> = {
       recipient,
       amount: amount.toString(),
       asset,
     };
+
+    // Throws ProofGenerationError if any required field is missing or invalid.
+    // Error messages never contain raw input values.
+    const witness = assertValidPayrollWitness(rawWitness);
 
     let proof: ProofPayload;
     try {
@@ -128,15 +220,37 @@ export class PayrollService {
     );
     this.logger?.info("contract_invocation_start", { method: "private_pay" });
 
-    const resultXdr = await this.contractWrapper.privatePay(
-      recipient,
-      amount,
-      asset,
-      proof,
-      this.signer,
-      this.network,
-      params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : undefined
-    );
+    let resultXdr: xdr.ScVal;
+    try {
+      resultXdr = await this.contractWrapper.privatePay(
+        recipient,
+        amount,
+        asset,
+        proof,
+        this.signer,
+        this.network,
+        params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : undefined
+      );
+    } catch (error) {
+      // Surfaces contract-level rejections -- including state-gating
+      // failures where the contract reverts because e.g. the company or
+      // payroll isn't in a state that allows this call -- with the same
+      // observability the validation-failure path already gets above.
+      // The error itself (its type and message, e.g. ContractExecutionError
+      // with ContractErrorCode.CONTRACT_REVERT) is rethrown unchanged so
+      // existing consumers that catch specific error types keep working.
+      //
+      // The error message is sanitized through redactError() before logging
+      // to prevent sensitive field values (privateKey=..., recipient=..., etc.)
+      // embedded in contract-level error messages from leaking into logs.
+      const safeMessage = error instanceof Error ? redactError(error).message : String(error);
+      this.logger?.error("contract_invocation_failed", {
+        method: "private_pay",
+        error: safeMessage,
+        code: error instanceof ZkPayrollError ? error.code : undefined,
+      });
+      throw error;
+    }
 
     params.onProgress?.(
       createPayrollProgressEvent({
@@ -162,6 +276,98 @@ export class PayrollService {
     return transactions.filter((t) => t.amount > criteria.minAmount);
   }
 
+  /**
+   * Validate a batch payroll payload locally before processing.
+   * Returns structured validation errors or empty array if valid.
+   */
+  validateBatch(entries: unknown[]): unknown[] {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { PayrollValidation } = require("./core/validation");
+    return PayrollValidation.validateBatchPayload(entries);
+  }
+
+  /**
+   * Process a batch of private payroll payments.
+   * Validates all batch payment entries first; rejects invalid payloads before submission.
+   *
+   * When `batchSize` is provided, validated entries are processed incrementally
+   * in deterministic, order-preserving batches via the batch pagination helper.
+   * Results are returned in the original entry order either way.
+   */
+  async processBatchPayments(entries: unknown[], batchSize?: number): Promise<PaymentResult[]> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { PayrollValidation } = require("./core/validation");
+    const payload: BatchPayload = PayrollValidation.assertValidBatchPayload(entries);
+
+    const results: PaymentResult[] = [];
+    for (const batch of iterateBatches(payload.entries, batchSize)) {
+      for (const entry of batch.items) {
+        const res = await this.processPayment(entry);
+        results.push(res);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Submit payroll payments in safe, sequential batches with progress callbacks
+   * and guarded retries (#472).
+   *
+   * Validates entries first, splits them into deterministic batches, and submits
+   * each batch sequentially. Emits privacy-safe progress events, guards against transient
+   * failures with exponential backoff retries, and redacts sensitive payment data on error.
+   *
+   * @param entries - Payment items to process
+   * @param options - Configuration for batch size, retries, and progress callbacks
+   * @returns Comprehensive batch submission result with execution statistics and results
+   */
+  async submitBatchPaymentsSafely(
+    entries: unknown[],
+    options?: SafeBatchSubmissionOptions<PaymentParams, PaymentResult>
+  ): Promise<SafeBatchSubmissionResult<PaymentResult>> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { PayrollValidation } = require("./core/validation");
+    const payload: BatchPayload = PayrollValidation.assertValidBatchPayload(entries);
+
+    return submitSequentialPayrollBatches(
+      payload.entries,
+      async (batchItems: PaymentParams[]) => {
+        const batchResults: PaymentResult[] = [];
+        for (const item of batchItems) {
+          const res = await this.processPayment(item);
+          batchResults.push(res);
+        }
+        return batchResults;
+      },
+      options
+    );
+  }
+
+  /** Filter archived, disputed, and held runs out of active operational views. */
+  filterActivePayrollRuns<T extends PayrollRunItem>(runs: T[]): T[] {
+    return filterActiveRuns(runs);
+  }
+
+  /** Filter safely archived runs (excluding disputed or held runs). */
+  filterArchivedPayrollRuns<T extends PayrollRunItem>(runs: T[]): T[] {
+    return filterArchivedRuns(runs);
+  }
+
+  /** Filter disputed payroll runs. */
+  filterDisputedPayrollRuns<T extends PayrollRunItem>(runs: T[]): T[] {
+    return filterDisputedRuns(runs);
+  }
+
+  /** Filter finalized payroll runs free of disputes or holds. */
+  filterFinalizedPayrollRuns<T extends PayrollRunItem>(runs: T[]): T[] {
+    return filterFinalizedRuns(runs);
+  }
+
+  /** Filter held payroll runs. */
+  filterHeldPayrollRuns<T extends PayrollRunItem>(runs: T[]): T[] {
+    return filterHeldRuns(runs);
+  }
+
   private validatePaymentParams(params: PaymentParams): void {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { PayrollValidation } = require("./core/validation");
@@ -169,12 +375,204 @@ export class PayrollService {
     if (!result.isValid) {
       // Map to backward-compatible PayrollError
       const firstError = result.errors[0];
-      let code = 0;
+      let code: number | string = 0;
       if (firstError.field === "recipient") code = PayrollServiceErrorCode.INVALID_RECIPIENT;
       else if (firstError.field === "amount") code = PayrollServiceErrorCode.INVALID_AMOUNT;
       else if (firstError.field === "asset") code = PayrollServiceErrorCode.INVALID_ASSET;
 
       throw new PayrollError(firstError.message, code);
     }
+  }
+
+  /**
+   * Generates a verifiable PayrollReceipt record for a completed payment.
+   * Sensitive values remain safely formatted or redacted.
+   */
+  createReceipt(
+    params: PaymentParams,
+    result: PaymentResult,
+    payrollId: string = `pr_${Date.now()}`,
+    overrides: Partial<CreatePayrollReceiptParams> = {}
+  ): PayrollReceipt {
+    return createPayrollReceipt({
+      payrollId,
+      settlementStatus: "settled",
+      transactionReference: {
+        txHash: result.txHash,
+        network: this.network,
+        confirmedAt: Date.now(),
+      },
+      totalAmount: params.amount,
+      currency: params.asset,
+      recipientCount: 1,
+      metadata: {
+        recipient: params.recipient,
+        asset: params.asset,
+        idempotencyKey: params.idempotencyKey,
+      },
+      ...overrides,
+    });
+  }
+
+  /**
+   * Verifies a payroll receipt against defined integrity, settlement,
+   * transaction reference, and metadata digest constraints.
+   */
+  verifyReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: ReceiptVerificationOptions
+  ): ReceiptVerificationResult {
+    return verifyPayrollReceipt(receipt, options);
+  }
+
+  /**
+   * Asserts that a payroll receipt is valid, throwing `PayrollReceiptVerificationError`
+   * if verification fails.
+   */
+  assertValidReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: ReceiptVerificationOptions
+  ): PayrollReceipt {
+    return assertValidPayrollReceipt(receipt, options);
+  }
+
+  /**
+   * Static helper: verifies a payroll receipt.
+   */
+  static verifyReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: ReceiptVerificationOptions
+  ): ReceiptVerificationResult {
+    return verifyPayrollReceipt(receipt, options);
+  }
+
+  /**
+   * Static helper: asserts validity of a payroll receipt.
+   */
+  static assertValidReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: ReceiptVerificationOptions
+  ): PayrollReceipt {
+    return assertValidPayrollReceipt(receipt, options);
+  }
+
+  /**
+   * Invalidates the cached configuration. If an employer address is provided,
+   * you may optionally target just that employer's configuration if your cache
+   * adapter supports it, otherwise this clears the entire CONFIGURATION namespace.
+   */
+  async invalidateConfigurationCache(employerAddress?: string): Promise<void> {
+    if (!this.cache) {
+      this.logger?.info("invalidateConfigurationCache called but no cache adapter is configured.");
+      return;
+    }
+
+    try {
+      this.logger?.info("invalidating_configuration_cache", { employerAddress });
+      // In a more granular implementation, we might delete a specific key for the employer.
+      // Here we invalidate the entire configuration namespace.
+      await this.cache.clearNamespace(CacheNamespace.CONFIGURATION);
+    } catch (error) {
+      this.logger?.error("configuration_cache_invalidation_failed", {
+        error: error instanceof Error ? redactError(error).message : String(error),
+        employerAddress,
+      });
+      // Clear failure handling: we throw a safe ZkPayrollError if invalidation fails,
+      // avoiding leakage of sensitive values.
+      throw new PayrollError(
+        `Failed to invalidate configuration cache: ${error instanceof Error ? error.message : String(error)}`,
+        PayrollServiceErrorCode.UNKNOWN_ERROR // or a more specific code if available
+      );
+    }
+  }
+
+  /**
+   * Handle an employer_updated event by invalidating the configuration cache.
+   * This provides the authorization/validation point: we only act if the event
+   * is a valid EmployerUpdatedEvent.
+   */
+  async handleEmployerUpdatedEvent(event: EmployerUpdatedEvent): Promise<void> {
+    if (event.type !== "employer_updated" || !event.employer) {
+      this.logger?.warn("invalid_employer_updated_event", { event });
+      return;
+    }
+
+    this.logger?.info("handling_employer_updated_event", { employer: event.employer });
+    await this.invalidateConfigurationCache(event.employer);
+  }
+
+  /**
+   * Validates a settlement receipt against the settlement workflow policy (#532).
+   *
+   * Lightweight operational gate for receipts produced after payroll finalization:
+   * checks receipt/payroll identifiers, settled status, transaction reference, and
+   * metadata digest shape — without echoing rejected values. Returns an explicit
+   * result instead of throwing; the display receipt ID inside the result is
+   * redacted, so it is safe for logs and UI feedback.
+   */
+  validateSettlementReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: SettlementReceiptValidationOptions
+  ): SettlementReceiptValidation {
+    return validateSettlementReceiptHelper(receipt, options);
+  }
+
+  /**
+   * Static helper: validates a settlement receipt (#532).
+   */
+  static validateSettlementReceipt(
+    receipt: PayrollReceipt | unknown,
+    options?: SettlementReceiptValidationOptions
+  ): SettlementReceiptValidation {
+    return validateSettlementReceiptHelper(receipt, options);
+  }
+
+  /**
+   * Registers the destination validation extension hook (#531) for every
+   * payment submitted through {@link PayrollService} in this process.
+   *
+   * The hook adds organizational destination policy (allowlists, compliance
+   * holds, internal account classification) on top of the built-in Stellar
+   * destination checks. Pass `undefined` to restore built-in validation.
+   * Hooks must never echo the rejected destination in their messages; see
+   * {@link DestinationValidationHook} for the required result shape.
+   */
+  static setDestinationValidationHook(hook?: DestinationValidationHook | null): void {
+    setDestinationValidationHook(hook);
+  }
+
+  /**
+   * Restores the default built-in destination validation, removing any
+   * process-wide extension hook registered via
+   * {@link PayrollService.setDestinationValidationHook} (#531).
+   */
+  static resetDestinationValidationHook(): void {
+    resetDestinationValidationHook();
+  }
+
+  /**
+   * Returns the currently registered destination validation extension hook,
+   * or `undefined` when built-in validation is active (#531).
+   */
+  static getDestinationValidationHook(): DestinationValidationHook | undefined {
+    return getRegisteredDestinationValidationHook();
+  }
+
+  /**
+   * Runs the destination validation gate (#531) without submitting a payment:
+   * built-in Stellar checks first, then the registered extension hook. Useful
+   * for pre-flight checks in UIs and batch tooling. Never throws and never
+   * echoes the rejected destination.
+   */
+  async validateDestination(value: unknown): Promise<DestinationWorkflowValidation> {
+    return validatePaymentDestination(value);
+  }
+
+  /**
+   * Static helper: runs the destination validation gate (#531) without a
+   * service instance. Never throws and never echoes the rejected destination.
+   */
+  static async validateDestination(value: unknown): Promise<DestinationWorkflowValidation> {
+    return validatePaymentDestination(value);
   }
 }

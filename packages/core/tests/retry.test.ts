@@ -1,7 +1,9 @@
 import {
   classifyError,
+  withRetry,
   RetryCategory,
   RetryDecision,
+  RetryTimeoutError,
 } from "../src/core/retry";
 import {
   ZkPayrollError,
@@ -68,10 +70,7 @@ describe("classifyError", () => {
 
   describe("ContractExecutionError", () => {
     it("classifies SIMULATION_FAILED as RETRYABLE", () => {
-      const error = new ContractExecutionError(
-        "sim failed",
-        ContractErrorCode.SIMULATION_FAILED
-      );
+      const error = new ContractExecutionError("sim failed", ContractErrorCode.SIMULATION_FAILED);
       expectRetryable(classifyError(error));
     });
 
@@ -84,18 +83,12 @@ describe("classifyError", () => {
     });
 
     it("classifies TRANSACTION_TIMEOUT as RETRYABLE", () => {
-      const error = new ContractExecutionError(
-        "timed out",
-        ContractErrorCode.TRANSACTION_TIMEOUT
-      );
+      const error = new ContractExecutionError("timed out", ContractErrorCode.TRANSACTION_TIMEOUT);
       expectRetryable(classifyError(error));
     });
 
     it("classifies INSUFFICIENT_FEE as NON_RETRYABLE", () => {
-      const error = new ContractExecutionError(
-        "fee too low",
-        ContractErrorCode.INSUFFICIENT_FEE
-      );
+      const error = new ContractExecutionError("fee too low", ContractErrorCode.INSUFFICIENT_FEE);
       expectNonRetryable(classifyError(error));
     });
 
@@ -220,5 +213,128 @@ describe("classifyError", () => {
       expect(typeof decision.reason).toBe("string");
       expect(decision.reason.length).toBeGreaterThan(0);
     });
+  });
+});
+
+describe("withRetry", () => {
+  it("returns the result on first success without retrying", async () => {
+    const fn = jest.fn().mockResolvedValue("ok");
+
+    const result = await withRetry(fn, { attempts: 3, delayMs: 1 });
+
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("succeeds after a retryable failure (success after retry)", async () => {
+    const fn = jest.fn().mockRejectedValueOnce(new Error("ECONNRESET")).mockResolvedValueOnce("ok");
+
+    const result = await withRetry(fn, { attempts: 3, delayMs: 1 });
+
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws the last error once max retries are exceeded", async () => {
+    const fn = jest.fn().mockRejectedValue(new Error("ECONNRESET"));
+
+    await expect(withRetry(fn, { attempts: 3, delayMs: 1 })).rejects.toThrow("ECONNRESET");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a NON_RETRYABLE error, even with attempts remaining", async () => {
+    const err = new ValidationError("bad input", "amount");
+    const fn = jest.fn().mockRejectedValue(err);
+
+    await expect(withRetry(fn, { attempts: 5, delayMs: 1 })).rejects.toBe(err);
+    // Only the first attempt runs -- classifyError(err) is NON_RETRYABLE,
+    // so the loop stops immediately instead of consuming the other 4.
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a CONTRACT_REVERT (unsafe-write outcome), even with attempts remaining", async () => {
+    const err = new ContractExecutionError("reverted", ContractErrorCode.CONTRACT_REVERT);
+    const fn = jest.fn().mockRejectedValue(err);
+
+    await expect(withRetry(fn, { attempts: 5, delayMs: 1 })).rejects.toBe(err);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("attempts: 1 disables retrying -- runs once and throws immediately", async () => {
+    const err = new Error("ECONNRESET"); // retryable classification, but no attempts left
+    const fn = jest.fn().mockRejectedValue(err);
+
+    await expect(withRetry(fn, { attempts: 1, delayMs: 1 })).rejects.toBe(err);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries UNKNOWN-classified errors up to the attempt limit", async () => {
+    const err = new Error("some totally novel failure");
+    const fn = jest.fn().mockRejectedValue(err);
+
+    await expect(withRetry(fn, { attempts: 3, delayMs: 1 })).rejects.toBe(err);
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("applies exponential backoff between attempts", async () => {
+    const delays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+    jest.spyOn(global, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return originalSetTimeout(fn, 0);
+    }) as unknown as typeof global.setTimeout);
+
+    const fn = jest.fn().mockRejectedValue(new Error("ECONNRESET"));
+    await expect(withRetry(fn, { attempts: 4, delayMs: 10, backoffFactor: 2 })).rejects.toThrow();
+
+    expect(delays).toEqual([10, 20, 40]);
+    jest.restoreAllMocks();
+  });
+
+  it("stops retrying and throws once the overall timeoutMs deadline is exceeded", async () => {
+    let call = 0;
+    const fn = jest.fn().mockImplementation(() => {
+      call += 1;
+      // Second call onward takes long enough to blow past the deadline.
+      return call === 1
+        ? Promise.reject(new Error("ECONNRESET"))
+        : new Promise((_, reject) => setTimeout(() => reject(new Error("ECONNRESET")), 50));
+    });
+
+    await expect(withRetry(fn, { attempts: 10, delayMs: 5, timeoutMs: 20 })).rejects.toThrow(
+      "ECONNRESET"
+    );
+
+    // Should have stopped well short of 10 attempts.
+    expect(fn.mock.calls.length).toBeLessThan(10);
+  });
+
+  it("calls onRetry with the attempt number and classification before each retry", async () => {
+    const onRetry = jest.fn();
+    const fn = jest.fn().mockRejectedValueOnce(new Error("ECONNRESET")).mockResolvedValueOnce("ok");
+
+    await withRetry(fn, { attempts: 3, delayMs: 1, onRetry });
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(
+      1,
+      expect.any(Error),
+      expect.objectContaining({ category: RetryCategory.RETRYABLE })
+    );
+  });
+
+  it("throws RetryTimeoutError when timeoutMs is already exceeded before any attempt runs", async () => {
+    const fn = jest.fn().mockResolvedValue("ok");
+
+    await expect(withRetry(fn, { attempts: 3, delayMs: 1, timeoutMs: -1 })).rejects.toBeInstanceOf(
+      RetryTimeoutError
+    );
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("exposes RetryTimeoutError with a descriptive message", () => {
+    const err = new RetryTimeoutError(5);
+    expect(err.name).toBe("RetryTimeoutError");
+    expect(err.message).toContain("5ms");
   });
 });

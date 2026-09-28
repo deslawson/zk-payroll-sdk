@@ -387,3 +387,45 @@ function WalletSelector() {
   );
 }
 */
+// ── Example 11: Typed SDK Errors & Diagnostic Context ──────────────────────
+
+import {
+  WalletRejectionError,
+  RpcTimeoutError,
+  InvalidResponseError,
+  ZkPayrollError,
+  toUserFriendlyError,
+} from "../../src/errors";
+
+async function handleTypedErrorsExample() {
+  const wallet = new FreighterAdapter();
+
+  try {
+    await wallet.connect("testnet");
+    await wallet.signTransaction("AAAA...");
+  } catch (error) {
+    if (error instanceof WalletRejectionError) {
+      console.error("User explicitly declined wallet operation.");
+      console.error("Wallet ID:", error.walletId);
+      console.error("Error code:", error.code); // e.g. WALLET_SIGNING_REJECTED
+      console.error("Original cause:", error.cause);
+    } else if (error instanceof RpcTimeoutError) {
+      console.error("RPC node timed out:", error.message);
+      console.error("Request ID for correlation:", error.context?.requestId);
+      console.error("Underlying cause:", error.cause);
+    } else if (error instanceof InvalidResponseError) {
+      console.error("RPC returned malformed response:", error.message);
+      console.error("Context:", error.context);
+    } else if (error instanceof WalletError) {
+      console.error("General wallet error:", error.code, error.message);
+    } else if (error instanceof ZkPayrollError) {
+      console.error("Base SDK error:", error.code, error.message, error.cause);
+    }
+
+    // Human-readable string for UI display:
+    const friendly = toUserFriendlyError(error);
+    console.log("UI Toast Message:", friendly.friendlyMessage);
+    console.log("Error Code:", friendly.code);
+    console.log("Context:", friendly.context);
+  }
+}

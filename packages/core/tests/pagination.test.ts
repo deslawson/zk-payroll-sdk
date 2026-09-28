@@ -7,7 +7,6 @@
 
 import {
   paginate,
-  paginate as paginateRecords,
   encodeCursor,
   decodeCursor,
   resolvePageSize,
@@ -122,7 +121,7 @@ describe("paginate — offset-based", () => {
   });
 
   it("returns a partial last page", () => {
-    const result = paginate(recor{ page: 3, pageSize: 20 });
+    const result = paginate(records, { page: 3, pageSize: 20 });
     expect(result.data).toHaveLength(15); // 55 - 40
     expect(result.meta.hasNextPage).toBe(false);
   });
@@ -153,7 +152,7 @@ describe("paginate — offset-based", () => {
 // paginate — cursor-based
 // ---------------------------------------------------------------------------
 
-descbe("paginate — cursor-based", () => {
+describe("paginate — cursor-based", () => {
   const records = makePayrollRecords(50);
 
   it("first page produces a nextCursor", () => {
@@ -188,7 +187,7 @@ descbe("paginate — cursor-based", () => {
   });
 
   it("last cursor-page has no nextCursor", () => {
-    const page1 = paginate(records, pageSize: 50 });
+    const page1 = paginate(records, { pageSize: 50 });
     expect(page1.meta.nextCursor).toBeUndefined();
   });
 
@@ -243,9 +242,7 @@ describe("filterPayrollRecords", () => {
       fromTimestamp: from,
       toTimestamp: to,
     });
-    expect(result.every((r) => r.timestamp >= from && r.timestamp <= to)).toBe(
-      true
-    );
+    expect(result.every((r) => r.timestamp >= from && r.timestamp <= to)).toBe(true);
   });
 
   it("returns all records when filter is empty", () => {
@@ -262,9 +259,7 @@ describe("filterPayrollRecords", () => {
       recipient: "GABC",
       minAmount: BigInt(500),
     });
-    expect(
-      result.every((r) => r.recipient === "GABC" && r.amount >= BigInt(500))
-    ).toBe(true);
+    expect(result.every((r) => r.recipient === "GABC" && r.amount >= BigInt(500))).toBe(true);
   });
 });
 
@@ -292,9 +287,7 @@ describe("filterAuditRecords", () => {
       fromTimestamp: from,
       toTimestamp: to,
     });
-    expect(result.every((r) => r.timestamp >= from && r.timestamp <= to)).toBe(
-      true
-    );
+    expect(result.every((r) => r.timestamp >= from && r.timestamp <= to)).toBe(true);
   });
 
   it("returns all when filter is empty", () => {
@@ -314,11 +307,7 @@ describe("getPayrollHistoryPage", () => {
   const records = makePayrollRecords(40);
 
   it("returns first page of filtered records", () => {
-    const result = getPayrollHistoryPage(
-      records,
-      { recipient: "GABC" },
-      { pageSize: 5 }
-    );
+    const result = getPayrollHistoryPage(records, { recipient: "GABC" }, { pageSize: 5 });
     expect(result.data.every((r) => r.recipient === "GABC")).toBe(true);
     expect(result.data.length).toBeLessThanOrEqual(5);
   });
@@ -329,11 +318,7 @@ describe("getPayrollHistoryPage", () => {
   });
 
   it("total reflects filtered count not full array", () => {
-    const result = getPayrollHistoryPage(
-      records,
-      { recipient: "GABC" },
-      { pageSize: 100 }
-    );
+    const result = getPayrollHistoryPage(records, { recipient: "GABC" }, { pageSize: 100 });
     expect(result.meta.total).toBe(result.data.length);
   });
 });
@@ -352,11 +337,7 @@ describe("getAuditRecordsPage", () => {
   });
 
   it("filters and paginates together", () => {
-    const result = getAuditRecordsPage(
-      records,
-      { action: "payment" },
-      { pageSize: 5 }
-    );
+    const result = getAuditRecordsPage(records, { action: "payment" }, { pageSize: 5 });
     expect(result.data.every((r) => r.action === "payment")).toBe(true);
   });
 
@@ -388,7 +369,7 @@ describe("paginateIterator", () => {
 
   it("yields a single page for small datasets", async () => {
     const records = makePayrollRecords(5);
-    const collected: (typeof records) = [];
+    const collected: typeof records = [];
 
     for await (const page of paginateIterator(records, { pageSize: 20 })) {
       collected.push(...page.data);
@@ -431,7 +412,7 @@ describe("paging boundary conditions", () => {
     const p2 = paginate(records, { pageSize: 1, cursor: p1.meta.nextCursor });
     const p3 = paginate(records, { pageSize: 1, cursor: p2.meta.nextCursor });
     expect(p1.data[0].id).toBe("rec-0");
-    expect(p2.data[0].id).toBe("c-1");
+    expect(p2.data[0].id).toBe("rec-1");
     expect(p3.data[0].id).toBe("rec-2");
     expect(p3.meta.hasNextPage).toBe(false);
   });
@@ -440,5 +421,86 @@ describe("paging boundary conditions", () => {
     const records = makePayrollRecords(200);
     const result = paginate(records, { pageSize: 9999 });
     expect(result.data).toHaveLength(MAX_PAGE_SIZE);
+  });
+
+  it("pageSize within limits but larger than the dataset returns all records on one page", () => {
+    const records = makePayrollRecords(7);
+    const result = paginate(records, { pageSize: 50 });
+    expect(result.data).toHaveLength(7);
+    expect(result.meta.total).toBe(7);
+    expect(result.meta.count).toBe(7);
+    expect(result.meta.hasNextPage).toBe(false);
+    expect(result.meta.hasPrevPage).toBe(false);
+    expect(result.meta.nextCursor).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent / interleaved pagination calls
+// ---------------------------------------------------------------------------
+
+describe("concurrent pagination calls", () => {
+  it("independent paginate calls over the same array do not interfere with each other", async () => {
+    const records = makePayrollRecords(60);
+
+    const [pageA, pageB, pageC] = await Promise.all([
+      Promise.resolve(paginate(records, { page: 1, pageSize: 20 })),
+      Promise.resolve(paginate(records, { page: 2, pageSize: 20 })),
+      Promise.resolve(paginate(records, { page: 3, pageSize: 20 })),
+    ]);
+
+    expect(pageA.data[0].id).toBe("rec-0");
+    expect(pageB.data[0].id).toBe("rec-20");
+    expect(pageC.data[0].id).toBe("rec-40");
+    expect(pageA.meta.total).toBe(60);
+    expect(pageB.meta.total).toBe(60);
+    expect(pageC.meta.total).toBe(60);
+  });
+
+  it("interleaving two independent cursor-based traversals does not cross-contaminate state", () => {
+    const records = makePayrollRecords(30);
+
+    // Two independent "callers" paginating the same records with different
+    // page sizes, advancing one step at a time in an interleaved order.
+    let cursorA: string | undefined;
+    let cursorB: string | undefined;
+
+    const pageA1 = paginate(records, { pageSize: 5, cursor: cursorA });
+    cursorA = pageA1.meta.nextCursor;
+
+    const pageB1 = paginate(records, { pageSize: 10, cursor: cursorB });
+    cursorB = pageB1.meta.nextCursor;
+
+    const pageA2 = paginate(records, { pageSize: 5, cursor: cursorA });
+    cursorA = pageA2.meta.nextCursor;
+
+    const pageB2 = paginate(records, { pageSize: 10, cursor: cursorB });
+    cursorB = pageB2.meta.nextCursor;
+
+    expect(pageA1.data[0].id).toBe("rec-0");
+    expect(pageA2.data[0].id).toBe("rec-5");
+    expect(pageB1.data[0].id).toBe("rec-0");
+    expect(pageB2.data[0].id).toBe("rec-10");
+  });
+
+  it("running multiple paginateIterator generators concurrently yields correct totals for each", async () => {
+    const recordsSmall = makePayrollRecords(12);
+    const recordsLarge = makePayrollRecords(45);
+
+    async function collect(records: PayrollRecord[], pageSize: number): Promise<number> {
+      let total = 0;
+      for await (const page of paginateIterator(records, { pageSize })) {
+        total += page.data.length;
+      }
+      return total;
+    }
+
+    const [totalSmall, totalLarge] = await Promise.all([
+      collect(recordsSmall, 4),
+      collect(recordsLarge, 7),
+    ]);
+
+    expect(totalSmall).toBe(12);
+    expect(totalLarge).toBe(45);
   });
 });

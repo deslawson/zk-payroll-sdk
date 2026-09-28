@@ -1,8 +1,14 @@
 import { rpc, xdr, nativeToScVal, Address, Keypair, Networks } from "@stellar/stellar-sdk";
 import type { ISigner } from "../signer/types";
 import { toISigner } from "../signer/KeypairSigner";
-import { BaseContractWrapper, InvokeOptions } from "./BaseContractWrapper";
+import { BaseContractWrapper, InvokeOptions, PreparedInvocation } from "./BaseContractWrapper";
 import { ProofPayload } from "../crypto/IProofGenerator";
+import type { RetryBudgetsConfig } from "../config";
+import {
+  estimatePreparedTransactionFee,
+  type TransactionFeeEstimate,
+  type TransactionFeeEstimatorOptions,
+} from "../fee-estimation";
 
 /**
  * PayrollContractWrapper — Concrete adapter for the ZK Payroll Soroban contract.
@@ -11,8 +17,8 @@ import { ProofPayload } from "../crypto/IProofGenerator";
  * via the BaseContractWrapper.invoke() pipeline.
  */
 export class PayrollContractWrapper extends BaseContractWrapper {
-  constructor(server: rpc.Server, contractId: string) {
-    super(server, contractId);
+  constructor(server: rpc.Server, contractId: string, retryBudgets?: RetryBudgetsConfig) {
+    super(server, contractId, retryBudgets);
   }
 
   /**
@@ -35,14 +41,103 @@ export class PayrollContractWrapper extends BaseContractWrapper {
     network: string = Networks.TESTNET,
     options?: InvokeOptions
   ): Promise<xdr.ScVal> {
-    const args: xdr.ScVal[] = [
-      new Address(recipient).toScVal(),
-      nativeToScVal(amount, { type: "i128" }),
-      nativeToScVal(asset, { type: "symbol" }),
-      this.encodeProof(proof),
-    ];
-
+    const args = this.encodePrivatePayArgs(recipient, amount, asset, proof);
     return this.invoke("private_pay", args, toISigner(signer), network, options);
+  }
+
+  /**
+   * Build (but do not sign or submit) a `private_pay` invocation: the
+   * deterministic half of a payroll submission — loading the account,
+   * building and simulating the transaction, and assembling it with the
+   * simulation's authorisation entries. Producing this never touches
+   * signing or broadcast, so it is safe to call again (e.g. to rebuild
+   * with a fresh sequence number) without any duplicate-submission risk.
+   *
+   * Pair with `submitPrivatePayInvocation` to sign and broadcast when
+   * you're ready, or to make an explicit, deliberate resubmission decision
+   * after a submission failure rather than blindly retrying.
+   *
+   * @param recipient        - Stellar address of the payment recipient
+   * @param amount           - Payment amount in stroops (i128)
+   * @param asset            - Asset identifier ("native" for XLM or a Soroban token contract address)
+   * @param proof            - ZK proof payload from IProofGenerator
+   * @param sourcePublicKey  - Public key of the account paying for and authorizing the payment
+   * @param network          - Network passphrase (defaults to TESTNET)
+   * @param requestId        - Optional explicit request ID for correlation tracing
+   */
+  async buildPrivatePayInvocation(
+    recipient: string,
+    amount: bigint,
+    asset: string,
+    proof: ProofPayload,
+    sourcePublicKey: string,
+    network: string = Networks.TESTNET,
+    requestId?: string
+  ): Promise<PreparedInvocation> {
+    const args = this.encodePrivatePayArgs(recipient, amount, asset, proof);
+    return this.buildInvocation("private_pay", args, sourcePublicKey, network, requestId);
+  }
+
+  /**
+   * Estimate the network fee for a `private_pay` submission without signing
+   * or broadcasting it.
+   *
+   * Builds and simulates the invocation, then reports the exact fee the
+   * assembled transaction would carry — the classic base fee plus the Soroban
+   * resource fee reported by simulation, optionally with a safety buffer
+   * (`bufferBps`). No signer is required and nothing is submitted, so it is
+   * safe to display the cost before a user approves a payroll run.
+   *
+   * The result contains only fee figures and operation counts; recipient,
+   * amount, asset, and proof values are never included, so it is safe to log.
+   *
+   * @param recipient        - Stellar address of the payment recipient
+   * @param amount           - Payment amount in stroops (i128)
+   * @param asset            - Asset identifier ("native" or a Soroban token contract address)
+   * @param proof            - ZK proof payload from IProofGenerator
+   * @param sourcePublicKey  - Public key of the account paying for and authorizing the payment
+   * @param network          - Network passphrase (defaults to TESTNET)
+   * @param options          - Optional fee buffer (basis points) and request ID for correlation
+   */
+  async estimatePrivatePayFee(
+    recipient: string,
+    amount: bigint,
+    asset: string,
+    proof: ProofPayload,
+    sourcePublicKey: string,
+    network: string = Networks.TESTNET,
+    options: TransactionFeeEstimatorOptions = {}
+  ): Promise<TransactionFeeEstimate> {
+    const prepared = await this.buildPrivatePayInvocation(
+      recipient,
+      amount,
+      asset,
+      proof,
+      sourcePublicKey,
+      network,
+      options.requestId
+    );
+    return estimatePreparedTransactionFee(prepared.transaction, options);
+  }
+
+  /**
+   * Sign and submit a `private_pay` invocation previously built with
+   * `buildPrivatePayInvocation`, then poll until it reaches a terminal
+   * state.
+   *
+   * Unsafe: broadcasts a signed transaction. Do not blindly retry a failed
+   * call to this method — see `buildPrivatePayInvocation`'s doc comment and
+   * docs/RETRY_POLICY.md.
+   *
+   * @param prepared - The output of `buildPrivatePayInvocation`
+   * @param signer   - Signer or Keypair that signs the transaction
+   * @returns        - The decoded XDR result value from the contract
+   */
+  async submitPrivatePayInvocation(
+    prepared: PreparedInvocation,
+    signer: Keypair | ISigner
+  ): Promise<xdr.ScVal> {
+    return this.submitInvocation(prepared, toISigner(signer));
   }
 
   /**
@@ -63,9 +158,27 @@ export class PayrollContractWrapper extends BaseContractWrapper {
   }
 
   /**
+   * Encode `private_pay`'s argument list (shared by `privatePay` and
+   * `buildPrivatePayInvocation` so both stay in sync).
+   */
+  private encodePrivatePayArgs(
+    recipient: string,
+    amount: bigint,
+    asset: string,
+    proof: ProofPayload
+  ): xdr.ScVal[] {
+    return [
+      new Address(recipient).toScVal(),
+      nativeToScVal(amount, { type: "i128" }),
+      nativeToScVal(asset, { type: "symbol" }),
+      this.encodeProof(proof),
+    ];
+  }
+
+  /**
    * Encode a ProofPayload into an XDR ScVal map for the contract verifier.
    */
-  private encodeProof(proof: ProofPayload): xdr.ScVal {
+  protected encodeProof(proof: ProofPayload): xdr.ScVal {
     const piA = xdr.ScVal.scvVec(proof.proof.pi_a.map((s) => nativeToScVal(s, { type: "string" })));
     const piB = xdr.ScVal.scvVec(
       proof.proof.pi_b.map((pair) =>

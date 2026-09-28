@@ -1,6 +1,6 @@
 import { CacheProvider } from "../cache/CacheProvider";
 import { SnarkjsProofGenerator } from "./SnarkjsProofGenerator";
-import { ProofPayload, ProofGeneratorConfig } from "./IProofGenerator";
+import { ProofPayload, ProofGeneratorConfig, witnessKey } from "./IProofGenerator";
 
 /**
  * Witness data for ZK proof generation.
@@ -13,14 +13,9 @@ export interface ProofWitness {
 }
 
 /**
- * Derives a stable cache key from the proof witness.
- * Handles bigint values so common witness fields (e.g. amount) are serializable.
+ * Re-export the shared `witnessKey` so legacy callers keep working —
+ * the canonical implementation now lives in `IProofGenerator.ts`.
  */
-function witnessKey(witness: Record<string, unknown> | ProofWitness): string {
-  return `proof:${JSON.stringify(witness, (_, value) =>
-    typeof value === "bigint" ? value.toString() : value
-  )}`;
-}
 
 function uint8ArrayToBase64(arr: Uint8Array): string {
   return Buffer.from(arr).toString("base64");

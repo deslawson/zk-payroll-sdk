@@ -148,6 +148,29 @@ export interface PaymentCancelledEvent {
  * }
  * ```
  */
+import {
+  EmployeeStatusUpdatedEvent,
+  decodeEmployeeStatusUpdatedEvent,
+  decodeEmployeeStatusUpdatedEvents,
+  isEmployeeStatusUpdatedEvent,
+} from "./events/employeeStatus";
+import {
+  PayrollDraftExpiryEvent,
+  parseDraftExpiryEvent,
+  parseDraftExpiryEvents,
+  isDraftExpiryEvent,
+} from "./events/draftExpiry";
+
+export type { EmployeeStatusUpdatedEvent, PayrollDraftExpiryEvent };
+export {
+  decodeEmployeeStatusUpdatedEvent,
+  decodeEmployeeStatusUpdatedEvents,
+  isEmployeeStatusUpdatedEvent,
+  parseDraftExpiryEvent,
+  parseDraftExpiryEvents,
+  isDraftExpiryEvent,
+};
+
 export type TypedContractEvent =
   | RegisteredEvent
   | RegistryUpdatedEvent
@@ -156,7 +179,9 @@ export type TypedContractEvent =
   | SalaryRevealedEvent
   | PaymentExecutedEvent
   | PaymentScheduledEvent
-  | PaymentCancelledEvent;
+  | PaymentCancelledEvent
+  | EmployeeStatusUpdatedEvent
+  | PayrollDraftExpiryEvent;
 
 // ── Error Types ──────────────────────────────────────────────────────────────
 
@@ -215,6 +240,15 @@ export function parseContractEvent(event: RawContractEvent): TypedContractEvent 
       return parsePaymentScheduled(event);
     case "payment_cancelled":
       return parsePaymentCancelled(event);
+    case "employee_status_updated":
+    case "employee_status_changed":
+    case "employee_suspended":
+    case "employee_reactivated":
+    case "employee_offboarded":
+    case "employee_created":
+      return decodeEmployeeStatusUpdatedEvent(event);
+    case "payroll_draft_expiry":
+      return parseDraftExpiryEvent(event);
     default:
       throw new EventParsingError(`Unknown event type: "${eventName}"`, event);
   }
@@ -234,11 +268,15 @@ export function parseContractEvents(events: RawContractEvent[]): TypedContractEv
 
 function parseRegistered(event: RawContractEvent): RegisteredEvent {
   const topics = event.topics;
+  const employer = decodeAddress(topics[1]);
+  if (!employer) {
+    throw new EventParsingError("Missing required employer topic in registered event");
+  }
   const data = decodeDataMap(event.data);
 
   return {
     type: "registered",
-    employer: decodeAddress(topics[1]),
+    employer,
     employee: decodeAddress(topics[2]),
     salary: decodeBigInt(data.salary),
     token: decodeAddress(data.token),
@@ -354,12 +392,23 @@ function parsePaymentCancelled(event: RawContractEvent): PaymentCancelledEvent {
 }
 
 // ── ScVal Decoding Helpers ───────────────────────────────────────────────────
+//
+// Exported so other event decoders (e.g. `events/employerOnboarding.ts`,
+// `events/operatorRemoval.ts`) can decode the same ScVal event shape without
+// duplicating this logic.
 
-function decodeEventName(topic: xdr.ScVal): string {
-  return topic.sym()?.toString() ?? "";
+export function decodeEventName(topic: xdr.ScVal): string {
+  try {
+    if (topic.switch()?.name === "scvSymbol") {
+      return topic.sym()?.toString() ?? "";
+    }
+  } catch {
+    // Ignore non-symbol topics
+  }
+  return "";
 }
 
-function decodeAddress(scVal: xdr.ScVal | undefined): string {
+export function decodeAddress(scVal: xdr.ScVal | undefined): string {
   if (!scVal) return "";
   try {
     return Address.fromScVal(scVal).toString();
@@ -368,34 +417,41 @@ function decodeAddress(scVal: xdr.ScVal | undefined): string {
   }
 }
 
-function decodeBigInt(scVal: xdr.ScVal | undefined): bigint {
+export function decodeBigInt(scVal: xdr.ScVal | undefined): bigint {
   if (!scVal) return 0n;
-  const i128 = scVal.i128();
-  if (i128) {
-    const hi = BigInt(i128.hi());
-    const lo = BigInt(i128.lo());
-    return (hi << 64n) | lo;
+  try {
+    const swName = scVal.switch()?.name;
+    if (swName === "scvI128") {
+      const i128 = scVal.i128();
+      const hi = BigInt(i128.hi().toString());
+      const lo = BigInt(i128.lo().toString());
+      return (hi << 64n) | lo;
+    }
+    if (swName === "scvU64") {
+      const u64 = scVal.u64();
+      return BigInt(u64.toString());
+    }
+  } catch {
+    return 0n;
   }
-  const u64 = scVal.u64();
-  if (u64) return BigInt(u64);
   return 0n;
 }
 
-function decodeU64AsNumber(scVal: xdr.ScVal | undefined): number {
+export function decodeU64AsNumber(scVal: xdr.ScVal | undefined): number {
   if (!scVal) return 0;
   const u64 = scVal.u64();
   if (u64) return Number(u64);
   return 0;
 }
 
-function decodeBytes(scVal: xdr.ScVal | undefined): string {
+export function decodeBytes(scVal: xdr.ScVal | undefined): string {
   if (!scVal) return "";
   const bytes = scVal.bytes();
   if (bytes) return Buffer.from(bytes).toString("hex");
   return "";
 }
 
-function decodeDataMap(scVal: xdr.ScVal): Record<string, xdr.ScVal> {
+export function decodeDataMap(scVal: xdr.ScVal): Record<string, xdr.ScVal> {
   const map = scVal.map();
   if (!map) return {};
   const entries: Record<string, xdr.ScVal> = {};

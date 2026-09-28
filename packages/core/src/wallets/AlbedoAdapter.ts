@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import {
   IWalletAdapter,
   WalletNetwork,
@@ -6,6 +5,7 @@ import {
   SignedTransaction,
   WalletError,
   WalletErrorCode,
+  WalletRejectionError,
 } from "./IWalletAdapter";
 
 /**
@@ -54,10 +54,10 @@ export class AlbedoAdapter implements IWalletAdapter {
       const response = await this.getAlbedoApi().pubKey();
 
       if (!response || !response.pubKey) {
-        throw new WalletError(
+        throw new WalletRejectionError(
           "Failed to get public key from Albedo",
-          WalletErrorCode.CONNECTION_REJECTED,
-          this.id
+          this.id,
+          WalletErrorCode.CONNECTION_REJECTED
         );
       }
 
@@ -81,17 +81,21 @@ export class AlbedoAdapter implements IWalletAdapter {
 
       // Check if user rejected
       if (error instanceof Error && error.message.includes("User rejected")) {
-        throw new WalletError(
+        throw new WalletRejectionError(
           "User rejected connection",
+          this.id,
           WalletErrorCode.CONNECTION_REJECTED,
-          this.id
+          {},
+          error
         );
       }
 
       throw new WalletError(
         `Failed to connect to Albedo: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }
@@ -115,7 +119,11 @@ export class AlbedoAdapter implements IWalletAdapter {
       });
 
       if (!response || !response.signed_xdr) {
-        throw new WalletError("User rejected signing", WalletErrorCode.SIGNING_REJECTED, this.id);
+        throw new WalletRejectionError(
+          "User rejected signing",
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED
+        );
       }
 
       return {
@@ -129,13 +137,21 @@ export class AlbedoAdapter implements IWalletAdapter {
 
       // Check if user rejected
       if (error instanceof Error && error.message.includes("User rejected")) {
-        throw new WalletError("User rejected signing", WalletErrorCode.SIGNING_REJECTED, this.id);
+        throw new WalletRejectionError(
+          "User rejected signing",
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED,
+          {},
+          error
+        );
       }
 
       throw new WalletError(
         `Failed to sign transaction: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }
@@ -153,10 +169,10 @@ export class AlbedoAdapter implements IWalletAdapter {
       });
 
       if (!response) {
-        throw new WalletError(
+        throw new WalletRejectionError(
           "User rejected signing or submission failed",
-          WalletErrorCode.SIGNING_REJECTED,
-          this.id
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED
         );
       }
 
@@ -169,13 +185,21 @@ export class AlbedoAdapter implements IWalletAdapter {
 
       // Check if user rejected
       if (error instanceof Error && error.message.includes("User rejected")) {
-        throw new WalletError("User rejected signing", WalletErrorCode.SIGNING_REJECTED, this.id);
+        throw new WalletRejectionError(
+          "User rejected signing",
+          this.id,
+          WalletErrorCode.SIGNING_REJECTED,
+          {},
+          error
+        );
       }
 
       throw new WalletError(
         `Failed to sign and submit transaction: ${error instanceof Error ? error.message : String(error)}`,
         WalletErrorCode.UNKNOWN_ERROR,
-        this.id
+        this.id,
+        {},
+        error
       );
     }
   }
@@ -185,7 +209,7 @@ export class AlbedoAdapter implements IWalletAdapter {
   }
 
   isAvailable(): boolean {
-    return typeof window !== "undefined" && !!(window as any).Albedo;
+    return typeof window !== "undefined" && !!(window as unknown as Record<string, unknown>).Albedo;
   }
 
   onConnectionChange(callback: (status: WalletConnectionStatus) => void): () => void {
@@ -205,11 +229,12 @@ export class AlbedoAdapter implements IWalletAdapter {
 
   // ── Private helpers ──────────────────────────────────────────────────────
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private getAlbedoApi(): any {
     if (!this.isAvailable()) {
       throw new WalletError("Albedo is not available", WalletErrorCode.NOT_INSTALLED, this.id);
     }
-    return (window as any).Albedo;
+    return (window as unknown as Record<string, unknown>).Albedo;
   }
 
   private setupEventListeners(): void {

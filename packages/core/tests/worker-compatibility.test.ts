@@ -163,9 +163,10 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
 
       expect(req.type).toBe("GENERATE_PROOF");
       if (req.type === "GENERATE_PROOF") {
-        expect(req.witness.amount).toBe(5000000000000000000n);
+        // Amount is normalized from bigint to string by the proof input sanitizer
+        expect(req.witness.amount).toBe("5000000000000000000");
         expect(req.witness.nullifier).toBe(12345678901234567890n);
-        expect(typeof req.witness.amount).toBe("bigint");
+        expect(typeof req.witness.amount).toBe("string");
       }
 
       worker.reply({ type: "PROOF_RESULT", id: req.id, payload: mockPayload });
@@ -209,7 +210,7 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       const req = worker.lastRequest();
 
       if (req.type === "GENERATE_PROOF") {
-        expect((req.witness.amounts as bigint[])).toEqual([100n, 200n, 300n]);
+        expect(req.witness.amounts as bigint[]).toEqual([100n, 200n, 300n]);
         expect((req.witness.amounts as bigint[])[0]).toBe(100n);
       }
 
@@ -231,7 +232,8 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       const req = worker.lastRequest();
 
       if (req.type === "GENERATE_PROOF") {
-        expect(typeof req.witness.amount).toBe("bigint");
+        // Amount is normalized from bigint to string by the proof input sanitizer
+        expect(typeof req.witness.amount).toBe("string");
         expect(typeof req.witness.count).toBe("number");
         expect(typeof req.witness.flag).toBe("boolean");
         expect(typeof req.witness.label).toBe("string");
@@ -282,7 +284,10 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       const emptyPayload: ProofPayload = {
         proof: {
           pi_a: ["1", "2"],
-          pi_b: [["3", "4"], ["5", "6"]],
+          pi_b: [
+            ["3", "4"],
+            ["5", "6"],
+          ],
           pi_c: ["7", "8"],
           protocol: "groth16",
           curve: "bn128",
@@ -377,7 +382,7 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
     });
 
     it("handles termination errors", async () => {
-      const { worker, generator } = setup();
+      const { generator } = setup();
       const promise = generator.generateProof({ amount: 100n });
 
       generator.terminate();
@@ -649,7 +654,7 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       const { worker, generator } = setup();
       const witness = { recipient: "GABC", amount: 5000n };
 
-      generator.generateProof(witness);
+      void generator.generateProof(witness);
       const req = worker.lastRequest();
 
       expect(req).toHaveProperty("type");
@@ -660,7 +665,8 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       if (req.type === "GENERATE_PROOF") {
         expect(req.type).toBe("GENERATE_PROOF");
         expect(typeof req.id).toBe("string");
-        expect(req.witness).toEqual(witness);
+        // Amount is normalized from bigint to string by the proof input sanitizer
+        expect(req.witness).toEqual({ ...witness, amount: "5000" });
         expect(req.config).toEqual(config);
       }
     });
@@ -668,7 +674,7 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
     it("sends correctly formatted PRELOAD_ARTIFACTS messages", async () => {
       const { worker, generator } = setup();
 
-      generator.preloadArtifacts();
+      void generator.preloadArtifacts();
       const req = worker.lastRequest();
 
       expect(req).toHaveProperty("type");
@@ -685,7 +691,7 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
     it("sends correctly formatted CLEAR_CACHE messages", async () => {
       const { worker, generator } = setup();
 
-      generator.clearCache();
+      void generator.clearCache();
       const req = worker.lastRequest();
 
       expect(req).toHaveProperty("type");
@@ -744,7 +750,10 @@ describe("Browser Worker Compatibility - Proof Generation APIs", () => {
       const largePayload: ProofPayload = {
         proof: {
           pi_a: ["1", "2"],
-          pi_b: [["3", "4"], ["5", "6"]],
+          pi_b: [
+            ["3", "4"],
+            ["5", "6"],
+          ],
           pi_c: ["7", "8"],
           protocol: "groth16",
           curve: "bn128",

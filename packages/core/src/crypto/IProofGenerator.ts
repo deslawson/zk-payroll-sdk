@@ -45,6 +45,20 @@ export interface ProofPayload {
     curve: string;
   };
   publicSignals: string[];
+  /** Optional metadata used to verify proof freshness before submission. */
+  metadata?: ProofMetadata;
+}
+
+/** Timestamps and payroll period bound to a generated proof. */
+export interface ProofMetadata {
+  /** ISO-8601 creation timestamp. */
+  createdAt: string;
+  /** ISO-8601 expiry timestamp. */
+  expiresAt: string;
+  /** Inclusive start of the payroll period covered by the proof. */
+  payrollPeriodStart: string;
+  /** Exclusive end of the payroll period covered by the proof. */
+  payrollPeriodEnd: string;
 }
 
 /** Configuration for proof generation artifacts. */
@@ -93,6 +107,41 @@ export interface ProofGeneratorConfig {
    * ```
    */
   zkeySource?: import("./IArtifactResolver").ArtifactSource;
+  /**
+   * Expected SHA-256 hex hash of the .wasm artifact.
+   * When set, the hash is verified before proof generation begins.
+   */
+  expectedWasmHash?: string;
+  /**
+   * Expected SHA-256 hex hash of the .zkey artifact.
+   * When set, the hash is verified before proof generation begins.
+   */
+  expectedZkeyHash?: string;
   /** Optional cache TTL in seconds for downloaded artifacts */
   artifactCacheTTL?: number;
+  /**
+   * Maximum number of concurrent proof generations this generator will run.
+   * Defaults to 1 to keep heavy snarkjs CPU work bounded — increase if your
+   * host has enough cores and memory to safely run multiple `groth16.fullProve`
+   * calls in parallel.
+   *
+   * Same-witness requests are deduplicated regardless of this setting.
+   */
+  maxConcurrency?: number;
+}
+
+/**
+ * Derives a stable cache key from a proof witness.
+ *
+ * BigInt values are stringified so common witness fields (amount, nullifier, etc.)
+ * remain deterministic across runs. Keys are stable between processes, so cache
+ * hits work across SDK restarts.
+ *
+ * Shared between `SnarkjsProofGenerator`, `WorkerProofGenerator`, and the legacy
+ * `ZKProofGenerator` helpers so deduplication semantics stay consistent.
+ */
+export function witnessKey(witness: Record<string, unknown>): string {
+  return `proof:${JSON.stringify(witness, (_, value) =>
+    typeof value === "bigint" ? value.toString() : value
+  )}`;
 }

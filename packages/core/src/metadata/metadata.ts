@@ -1,5 +1,5 @@
 import {
-  ContractMetadata,
+  NetworkProfile,
   MetadataValidationError,
   MetadataValidationResult,
   MetadataErrorCode,
@@ -10,15 +10,12 @@ const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
 const STELLAR_SECRET_RE = /^S[A-Z2-7]{55}$/;
 const URL_RE = /^https?:\/\/.+/;
 
-const REQUIRED_FIELDS: (keyof ContractMetadata)[] = [
-  "networkUrl",
-  "networkPassphrase",
-];
+const REQUIRED_FIELDS: (keyof NetworkProfile)[] = ["networkUrl", "networkPassphrase"];
 
 export function getContractMetadata(
   environment: string,
-  overrides?: Partial<ContractMetadata>
-): ContractMetadata {
+  overrides?: Partial<NetworkProfile>
+): NetworkProfile {
   const env = ENVIRONMENT_MAP[environment];
   if (!env) {
     throw new Error(
@@ -43,9 +40,23 @@ export function listKnownEnvironments(): { name: string; label: string }[] {
   }));
 }
 
+export interface ValidateContractMetadataOptions {
+  /**
+   * When true (the default), `networkPassphrase` must match one of the
+   * known environments' passphrases. Set to false when validating a
+   * genuinely custom network profile — a private/custom Stellar network
+   * legitimately has its own passphrase that will never appear in
+   * `KNOWN_ENVIRONMENTS`, so enforcing the whitelist there would reject
+   * every valid custom profile.
+   */
+  requireKnownPassphrase?: boolean;
+}
+
 export function validateContractMetadata(
-  metadata: ContractMetadata
+  metadata: NetworkProfile,
+  options: ValidateContractMetadataOptions = {}
 ): MetadataValidationResult {
+  const { requireKnownPassphrase = true } = options;
   const errors: MetadataValidationError[] = [];
 
   for (const field of REQUIRED_FIELDS) {
@@ -67,7 +78,7 @@ export function validateContractMetadata(
     });
   }
 
-  if (metadata.networkPassphrase) {
+  if (metadata.networkPassphrase && requireKnownPassphrase) {
     const knownPassphrases = Object.values(ENVIRONMENT_MAP).map(
       (e) => e.metadata.networkPassphrase
     );
@@ -80,7 +91,7 @@ export function validateContractMetadata(
     }
   }
 
-  const contractFields: (keyof ContractMetadata)[] = [
+  const contractFields: (keyof NetworkProfile)[] = [
     "payrollRegistryId",
     "salaryCommitmentId",
     "proofVerifierId",
@@ -98,14 +109,19 @@ export function validateContractMetadata(
     }
   }
 
-  if (
-    metadata.adminPublicKey &&
-    !STELLAR_SECRET_RE.test(metadata.adminPublicKey)
-  ) {
+  if (metadata.adminPublicKey && !STELLAR_SECRET_RE.test(metadata.adminPublicKey)) {
     errors.push({
       field: "adminPublicKey",
       message: "Invalid Stellar secret key format",
       code: MetadataErrorCode.INVALID_ADMIN_KEY,
+    });
+  }
+
+  if (metadata.explorerUrl && !URL_RE.test(metadata.explorerUrl)) {
+    errors.push({
+      field: "explorerUrl",
+      message: `Invalid explorer URL: "${metadata.explorerUrl}"`,
+      code: MetadataErrorCode.INVALID_EXPLORER_URL,
     });
   }
 
@@ -115,9 +131,39 @@ export function validateContractMetadata(
   };
 }
 
-export function buildClientConfig(
-  metadata: ContractMetadata
-): {
+export type NetworkProfileInput = string | NetworkProfile;
+
+/**
+ * Resolves a network environment profile for SDK consumers (e.g. dashboard
+ * environment switchers).
+ *
+ * - Pass a known environment name ("testnet" | "futurenet" | "mainnet" |
+ *   "standalone" | "localnet") to get its well-known profile back.
+ * - Pass a full `NetworkProfile` object to resolve a custom profile. It is
+ *   validated (required fields present, well-formed URLs/IDs) without
+ *   requiring the passphrase to match a known network, since a custom
+ *   profile's whole point is to describe a network the SDK doesn't already
+ *   know about. On validation failure, throws an `Error` whose message
+ *   explains every missing or invalid field.
+ *
+ * @throws {Error} if a string input doesn't match a known environment, or a
+ *   custom profile object fails validation.
+ */
+export function resolveNetworkProfile(input: NetworkProfileInput): NetworkProfile {
+  if (typeof input === "string") {
+    return getContractMetadata(input);
+  }
+
+  const result = validateContractMetadata(input, { requireKnownPassphrase: false });
+  if (!result.valid) {
+    const details = result.errors.map((e) => `${e.field}: ${e.message}`).join("; ");
+    throw new Error(`Invalid custom network profile — ${details}`);
+  }
+
+  return input;
+}
+
+export function buildClientConfig(metadata: NetworkProfile): {
   networkUrl: string;
   contractIds: Record<string, string>;
 } {

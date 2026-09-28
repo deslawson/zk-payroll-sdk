@@ -31,6 +31,16 @@ export class BatchValidationFailedError extends ZkPayrollError {
 }
 
 /**
+ * Validates an array of batch payment entries.
+ * Returns an array of structured BatchValidationError objects; empty array means valid.
+ */
+export function validateBatchPayload(entries: BatchPaymentEntry[]): BatchValidationError[] {
+  const builder = new BatchPayloadBuilder();
+  builder.addMany(entries);
+  return builder.validate();
+}
+
+/**
  * Fluent builder for composing and validating batch payroll payloads.
  *
  * @example
