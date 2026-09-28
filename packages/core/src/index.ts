@@ -77,6 +77,7 @@ export * from "./clients";
 
 // ── Environment Sanity Checker ──────────────────────────────────────────────
 export * from "./sanity";
+export * from "./employer-readiness";
 
 // ── Transaction Simulation ──────────────────────────────────────────────────
 export * from "./simulation";
